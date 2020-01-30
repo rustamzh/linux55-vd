@@ -70,7 +70,7 @@ sha256sums=('a6fbd4ee903c128367892c2393ee0d9657b6ed3ea90016d4dc6f1f6da20b2330'
             'c88af29e587fb769b1902966800212079920435871d96cc9bbfbaab3a2880dc8'
             '6f3373cceecc2e93b76d9b8ccd5c975423ea906eec7c0a4cfd723a59c2882636'
             'ab010dc5ef6ce85d352956e5996d242246ecd0912b30f0b72025c38eadff8cd5'
-            'c14f60f37c5ef16d104aaa05fdc470f8d6d341181f5370b92918c283728e5625'
+            '47ec1e67dbd355a9cfa457a9c9a796d756c7159194d36917ab453e20a60114e3'
             '15a2ec0128ee1910b13c841bda7f90172b6731bfce4fba9d685bfb2333a3d85e'
             '0556859a8168c8f7da9af8e2059d33216d9e5378d2cac70ca54c5ff843fa5add'
             '7a2758f86dd1339f0f1801de2dbea059b55bf3648e240878b11e6d6890d3089c'
@@ -178,7 +178,7 @@ prepare() {
 }
 
 build() {
-  cd "${srcdir}/linux-${pkgver}"
+  cd "${srcdir}/linux-${_basekernel}"
 
   # build!
   make ${MAKEFLAGS} LOCALVERSION= bzImage modules
@@ -190,7 +190,7 @@ package_linux55-vd() {
   optdepends=('crda: to set the correct wireless channels of your country')
   provides=("linux=${pkgver}")
 
-  cd "${srcdir}/linux-${pkgver}"
+  cd "${srcdir}/linux-${_basekernel}"
 
   KARCH=x86
 
@@ -229,6 +229,7 @@ package_linux55-vd() {
   # remove build and source links
   rm $modulesdir/source
   rm $modulesdir/build
+  [[ -f ./certs/vd55-kernel-key.pem ]] && rm ./certs/vd55-kernel-key.pem
 
   # Fixing permissions
   printf '\n'
@@ -246,7 +247,7 @@ package_linux55-vd-headers() {
   pkgdesc="Header files and scripts for building modules for ${pkgbase/linux/Linux} vd kernel"
   provides=("linux-headers=$pkgver")
 
-  cd "${srcdir}/linux-${pkgver}"
+  cd "${srcdir}/linux-${_basekernel}"
   local kernver="$(<version)"
   local _builddir="${pkgdir}/usr/lib/modules/${kernver}/build"
 
