@@ -1,0 +1,2209 @@
+From b9fa0a3acfd86c7d02cf0aac5105c0297bf3c5b0 Mon Sep 17 00:00:00 2001
+From: Vadim Pasternak <vadimp@mellanox.com>
+Date: Mon, 13 Jan 2020 15:08:36 +0000
+Subject: hwmon: (pmbus/core) Add support for vid mode detection per page bases
+
+Add support for VID protocol detection per page bases, instead of
+detecting it based on "PMBU_VOUT" readout from page 0 for all the pages
+supported by particular device.
+The reason that some devices allows to configure different VID modes
+per page within the same device.
+Patch modifies the field "vrm_version" within the structure
+"pmbus_driver_info" to be per page array.
+
+Signed-off-by: Vadim Pasternak <vadimp@mellanox.com>
+Link: https://lore.kernel.org/r/20200113150841.17670-2-vadimp@mellanox.com
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/pmbus/max20751.c   |  2 +-
+ drivers/hwmon/pmbus/pmbus.c      |  5 +++--
+ drivers/hwmon/pmbus/pmbus.h      |  2 +-
+ drivers/hwmon/pmbus/pmbus_core.c |  2 +-
+ drivers/hwmon/pmbus/pxe1610.c    | 44 ++++++++++++++++++++++------------------
+ drivers/hwmon/pmbus/tps53679.c   | 44 +++++++++++++++++++++-------------------
+ 6 files changed, 53 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/hwmon/pmbus/max20751.c b/drivers/hwmon/pmbus/max20751.c
+index ee5f0cdbde06..da3c38cb9a5c 100644
+--- a/drivers/hwmon/pmbus/max20751.c
++++ b/drivers/hwmon/pmbus/max20751.c
+@@ -16,7 +16,7 @@ static struct pmbus_driver_info max20751_info = {
+ 	.pages = 1,
+ 	.format[PSC_VOLTAGE_IN] = linear,
+ 	.format[PSC_VOLTAGE_OUT] = vid,
+-	.vrm_version = vr12,
++	.vrm_version[0] = vr12,
+ 	.format[PSC_TEMPERATURE] = linear,
+ 	.format[PSC_CURRENT_OUT] = linear,
+ 	.format[PSC_POWER] = linear,
+diff --git a/drivers/hwmon/pmbus/pmbus.c b/drivers/hwmon/pmbus/pmbus.c
+index 879aac6ed092..51e8312b6c2d 100644
+--- a/drivers/hwmon/pmbus/pmbus.c
++++ b/drivers/hwmon/pmbus/pmbus.c
+@@ -115,7 +115,7 @@ static int pmbus_identify(struct i2c_client *client,
+ 	}
+ 
+ 	if (pmbus_check_byte_register(client, 0, PMBUS_VOUT_MODE)) {
+-		int vout_mode;
++		int vout_mode, i;
+ 
+ 		vout_mode = pmbus_read_byte_data(client, 0, PMBUS_VOUT_MODE);
+ 		if (vout_mode >= 0 && vout_mode != 0xff) {
+@@ -124,7 +124,8 @@ static int pmbus_identify(struct i2c_client *client,
+ 				break;
+ 			case 1:
+ 				info->format[PSC_VOLTAGE_OUT] = vid;
+-				info->vrm_version = vr11;
++				for (i = 0; i < info->pages; i++)
++					info->vrm_version[i] = vr11;
+ 				break;
+ 			case 2:
+ 				info->format[PSC_VOLTAGE_OUT] = direct;
+diff --git a/drivers/hwmon/pmbus/pmbus.h b/drivers/hwmon/pmbus/pmbus.h
+index 90d6c9e23d5f..423c1464bf52 100644
+--- a/drivers/hwmon/pmbus/pmbus.h
++++ b/drivers/hwmon/pmbus/pmbus.h
+@@ -393,7 +393,7 @@ enum vrm_version { vr11 = 0, vr12, vr13 };
+ struct pmbus_driver_info {
+ 	int pages;		/* Total number of pages */
+ 	enum pmbus_data_format format[PSC_NUM_CLASSES];
+-	enum vrm_version vrm_version;
++	enum vrm_version vrm_version[PMBUS_PAGES]; /* vrm version per page */
+ 	/*
+ 	 * Support one set of coefficients for each sensor type
+ 	 * Used for chips providing data in direct mode.
+diff --git a/drivers/hwmon/pmbus/pmbus_core.c b/drivers/hwmon/pmbus/pmbus_core.c
+index 2c196eddbb8d..5ba92d148677 100644
+--- a/drivers/hwmon/pmbus/pmbus_core.c
++++ b/drivers/hwmon/pmbus/pmbus_core.c
+@@ -696,7 +696,7 @@ static long pmbus_reg2data_vid(struct pmbus_data *data,
+ 	long val = sensor->data;
+ 	long rv = 0;
+ 
+-	switch (data->info->vrm_version) {
++	switch (data->info->vrm_version[sensor->page]) {
+ 	case vr11:
+ 		if (val >= 0x02 && val <= 0xb2)
+ 			rv = DIV_ROUND_CLOSEST(160000 - (val - 2) * 625, 100);
+diff --git a/drivers/hwmon/pmbus/pxe1610.c b/drivers/hwmon/pmbus/pxe1610.c
+index ebe3f023f840..517584cff3de 100644
+--- a/drivers/hwmon/pmbus/pxe1610.c
++++ b/drivers/hwmon/pmbus/pxe1610.c
+@@ -19,26 +19,30 @@
+ static int pxe1610_identify(struct i2c_client *client,
+ 			     struct pmbus_driver_info *info)
+ {
+-	if (pmbus_check_byte_register(client, 0, PMBUS_VOUT_MODE)) {
+-		u8 vout_mode;
+-		int ret;
+-
+-		/* Read the register with VOUT scaling value.*/
+-		ret = pmbus_read_byte_data(client, 0, PMBUS_VOUT_MODE);
+-		if (ret < 0)
+-			return ret;
+-
+-		vout_mode = ret & GENMASK(4, 0);
+-
+-		switch (vout_mode) {
+-		case 1:
+-			info->vrm_version = vr12;
+-			break;
+-		case 2:
+-			info->vrm_version = vr13;
+-			break;
+-		default:
+-			return -ENODEV;
++	int i;
++
++	for (i = 0; i < PXE1610_NUM_PAGES; i++) {
++		if (pmbus_check_byte_register(client, i, PMBUS_VOUT_MODE)) {
++			u8 vout_mode;
++			int ret;
++
++			/* Read the register with VOUT scaling value.*/
++			ret = pmbus_read_byte_data(client, i, PMBUS_VOUT_MODE);
++			if (ret < 0)
++				return ret;
++
++			vout_mode = ret & GENMASK(4, 0);
++
++			switch (vout_mode) {
++			case 1:
++				info->vrm_version[i] = vr12;
++				break;
++			case 2:
++				info->vrm_version[i] = vr13;
++				break;
++			default:
++				return -ENODEV;
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/hwmon/pmbus/tps53679.c b/drivers/hwmon/pmbus/tps53679.c
+index 86bb3aca09ed..163e8c6aaa8e 100644
+--- a/drivers/hwmon/pmbus/tps53679.c
++++ b/drivers/hwmon/pmbus/tps53679.c
+@@ -24,27 +24,29 @@ static int tps53679_identify(struct i2c_client *client,
+ 			     struct pmbus_driver_info *info)
+ {
+ 	u8 vout_params;
+-	int ret;
+-
+-	/* Read the register with VOUT scaling value.*/
+-	ret = pmbus_read_byte_data(client, 0, PMBUS_VOUT_MODE);
+-	if (ret < 0)
+-		return ret;
+-
+-	vout_params = ret & GENMASK(4, 0);
+-
+-	switch (vout_params) {
+-	case TPS53679_PROT_VR13_10MV:
+-	case TPS53679_PROT_VR12_5_10MV:
+-		info->vrm_version = vr13;
+-		break;
+-	case TPS53679_PROT_VR13_5MV:
+-	case TPS53679_PROT_VR12_5MV:
+-	case TPS53679_PROT_IMVP8_5MV:
+-		info->vrm_version = vr12;
+-		break;
+-	default:
+-		return -EINVAL;
++	int i, ret;
++
++	for (i = 0; i < TPS53679_PAGE_NUM; i++) {
++		/* Read the register with VOUT scaling value.*/
++		ret = pmbus_read_byte_data(client, i, PMBUS_VOUT_MODE);
++		if (ret < 0)
++			return ret;
++
++		vout_params = ret & GENMASK(4, 0);
++
++		switch (vout_params) {
++		case TPS53679_PROT_VR13_10MV:
++		case TPS53679_PROT_VR12_5_10MV:
++			info->vrm_version[i] = vr13;
++			break;
++		case TPS53679_PROT_VR13_5MV:
++		case TPS53679_PROT_VR12_5MV:
++		case TPS53679_PROT_IMVP8_5MV:
++			info->vrm_version[i] = vr12;
++			break;
++		default:
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	return 0;
+-- 
+cgit 1.2-0.3.lf.el7
+
+From 9d72340b6ade9457fc79c7059fcc62e5b888f9a5 Mon Sep 17 00:00:00 2001
+From: Vadim Pasternak <vadimp@mellanox.com>
+Date: Mon, 13 Jan 2020 15:08:37 +0000
+Subject: hwmon: (pmbus/core) Add support for Intel IMVP9 and AMD 6.25mV modes
+
+Extend "vrm_version" with the type for Intel IMVP9 and AMD 6.25mV VID
+modes.
+Add calculation for those types.
+
+Signed-off-by: Vadim Pasternak <vadimp@mellanox.com>
+Link: https://lore.kernel.org/r/20200113150841.17670-3-vadimp@mellanox.com
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/pmbus/pmbus.h      | 2 +-
+ drivers/hwmon/pmbus/pmbus_core.c | 8 ++++++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/hwmon/pmbus/pmbus.h b/drivers/hwmon/pmbus/pmbus.h
+index 423c1464bf52..13b34bd67f23 100644
+--- a/drivers/hwmon/pmbus/pmbus.h
++++ b/drivers/hwmon/pmbus/pmbus.h
+@@ -388,7 +388,7 @@ enum pmbus_sensor_classes {
+ #define PMBUS_PAGE_VIRTUAL	BIT(31)
+ 
+ enum pmbus_data_format { linear = 0, direct, vid };
+-enum vrm_version { vr11 = 0, vr12, vr13 };
++enum vrm_version { vr11 = 0, vr12, vr13, imvp9, amd625mv };
+ 
+ struct pmbus_driver_info {
+ 	int pages;		/* Total number of pages */
+diff --git a/drivers/hwmon/pmbus/pmbus_core.c b/drivers/hwmon/pmbus/pmbus_core.c
+index 5ba92d148677..d9c17feb7b4a 100644
+--- a/drivers/hwmon/pmbus/pmbus_core.c
++++ b/drivers/hwmon/pmbus/pmbus_core.c
+@@ -709,6 +709,14 @@ static long pmbus_reg2data_vid(struct pmbus_data *data,
+ 		if (val >= 0x01)
+ 			rv = 500 + (val - 1) * 10;
+ 		break;
++	case imvp9:
++		if (val >= 0x01)
++			rv = 200 + (val - 1) * 10;
++		break;
++	case amd625mv:
++		if (val >= 0x0 && val <= 0xd8)
++			rv = DIV_ROUND_CLOSEST(155000 - val * 625, 100);
++		break;
+ 	}
+ 	return rv;
+ }
+-- 
+cgit 1.2-0.3.lf.el7
+
+From a6d210da1a01cb5c3fd4d2dd7b5920642f66677c Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Sun, 29 Apr 2018 08:39:24 -0700
+Subject: hwmon: (k10temp) Use bitops
+
+Using bitops makes bit masks and shifts easier to read.
+
+Tested-by: Brad Campbell <lists2009@fnarfbargle.com>
+Tested-by: Bernhard Gebetsberger <bernhard.gebetsberger@gmx.at>
+Tested-by: Holger Kiehl <holger.kiehl@dwd.de>
+Tested-by: Michael Larabel <michael@phoronix.com>
+Tested-by: Jonathan McDowell <noodles@earth.li>
+Tested-by: Ken Moffat <zarniwhoop73@googlemail.com>
+Tested-by: Darren Salt <devspam@moreofthesa.me.uk>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/k10temp.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/hwmon/k10temp.c b/drivers/hwmon/k10temp.c
+index 5c1dddde193c..8807d7da68db 100644
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@ -5,6 +5,7 @@
+  * Copyright (c) 2009 Clemens Ladisch <clemens@ladisch.de>
+  */
+ 
++#include <linux/bitops.h>
+ #include <linux/err.h>
+ #include <linux/hwmon.h>
+ #include <linux/hwmon-sysfs.h>
+@@ -31,22 +32,22 @@ static DEFINE_MUTEX(nb_smu_ind_mutex);
+ #endif
+ 
+ /* CPUID function 0x80000001, ebx */
+-#define CPUID_PKGTYPE_MASK	0xf0000000
++#define CPUID_PKGTYPE_MASK	GENMASK(31, 28)
+ #define CPUID_PKGTYPE_F		0x00000000
+ #define CPUID_PKGTYPE_AM2R2_AM3	0x10000000
+ 
+ /* DRAM controller (PCI function 2) */
+ #define REG_DCT0_CONFIG_HIGH		0x094
+-#define  DDR3_MODE			0x00000100
++#define  DDR3_MODE			BIT(8)
+ 
+ /* miscellaneous (PCI function 3) */
+ #define REG_HARDWARE_THERMAL_CONTROL	0x64
+-#define  HTC_ENABLE			0x00000001
++#define  HTC_ENABLE			BIT(0)
+ 
+ #define REG_REPORTED_TEMPERATURE	0xa4
+ 
+ #define REG_NORTHBRIDGE_CAPABILITIES	0xe8
+-#define  NB_CAP_HTC			0x00000400
++#define  NB_CAP_HTC			BIT(10)
+ 
+ /*
+  * For F15h M60h and M70h, REG_HARDWARE_THERMAL_CONTROL
+@@ -60,6 +61,9 @@ static DEFINE_MUTEX(nb_smu_ind_mutex);
+ /* F17h M01h Access througn SMN */
+ #define F17H_M01H_REPORTED_TEMP_CTRL_OFFSET	0x00059800
+ 
++#define CUR_TEMP_SHIFT				21
++#define CUR_TEMP_RANGE_SEL_MASK			BIT(19)
++
+ struct k10temp_data {
+ 	struct pci_dev *pdev;
+ 	void (*read_htcreg)(struct pci_dev *pdev, u32 *regval);
+@@ -129,7 +133,7 @@ static unsigned int get_raw_temp(struct k10temp_data *data)
+ 	u32 regval;
+ 
+ 	data->read_tempreg(data->pdev, &regval);
+-	temp = (regval >> 21) * 125;
++	temp = (regval >> CUR_TEMP_SHIFT) * 125;
+ 	if (regval & data->temp_adjust_mask)
+ 		temp -= 49000;
+ 	return temp;
+@@ -312,7 +316,7 @@ static int k10temp_probe(struct pci_dev *pdev,
+ 		data->read_htcreg = read_htcreg_nb_f15;
+ 		data->read_tempreg = read_tempreg_nb_f15;
+ 	} else if (boot_cpu_data.x86 == 0x17 || boot_cpu_data.x86 == 0x18) {
+-		data->temp_adjust_mask = 0x80000;
++		data->temp_adjust_mask = CUR_TEMP_RANGE_SEL_MASK;
+ 		data->read_tempreg = read_tempreg_nb_f17;
+ 		data->show_tdie = true;
+ 	} else {
+-- 
+cgit 1.2-0.3.lf.el7
+
+From d547552a1bf1deb321e787a6e6e2a9774573a35f Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Tue, 24 Dec 2019 07:20:55 -0800
+Subject: hmon: (k10temp) Convert to use devm_hwmon_device_register_with_info
+
+Convert driver to use devm_hwmon_device_register_with_info to simplify
+the code and to reduce its size.
+
+Old size (x86_64):
+   text	   data	    bss	    dec	    hex	filename
+   8247	   4488	     64	  12799	   31ff	drivers/hwmon/k10temp.o
+New size:
+   text	   data	    bss	    dec	    hex	filename
+   6778	   2792	     64	   9634	   25a2	drivers/hwmon/k10temp.o
+
+Tested-by: Brad Campbell <lists2009@fnarfbargle.com>
+Tested-by: Bernhard Gebetsberger <bernhard.gebetsberger@gmx.at>
+Tested-by: Holger Kiehl <holger.kiehl@dwd.de>
+Tested-by: Michael Larabel <michael@phoronix.com>
+Tested-by: Jonathan McDowell <noodles@earth.li>
+Tested-by: Ken Moffat <zarniwhoop73@googlemail.com>
+Tested-by: Darren Salt <devspam@moreofthesa.me.uk>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/k10temp.c | 213 +++++++++++++++++++++++++-----------------------
+ 1 file changed, 112 insertions(+), 101 deletions(-)
+
+diff --git a/drivers/hwmon/k10temp.c b/drivers/hwmon/k10temp.c
+index 8807d7da68db..c45f6498a59b 100644
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@ -1,14 +1,15 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ /*
+- * k10temp.c - AMD Family 10h/11h/12h/14h/15h/16h processor hardware monitoring
++ * k10temp.c - AMD Family 10h/11h/12h/14h/15h/16h/17h
++ *		processor hardware monitoring
+  *
+  * Copyright (c) 2009 Clemens Ladisch <clemens@ladisch.de>
++ * Copyright (c) 2020 Guenter Roeck <linux@roeck-us.net>
+  */
+ 
+ #include <linux/bitops.h>
+ #include <linux/err.h>
+ #include <linux/hwmon.h>
+-#include <linux/hwmon-sysfs.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
+@@ -127,10 +128,10 @@ static void read_tempreg_nb_f17(struct pci_dev *pdev, u32 *regval)
+ 		     F17H_M01H_REPORTED_TEMP_CTRL_OFFSET, regval);
+ }
+ 
+-static unsigned int get_raw_temp(struct k10temp_data *data)
++static long get_raw_temp(struct k10temp_data *data)
+ {
+-	unsigned int temp;
+ 	u32 regval;
++	long temp;
+ 
+ 	data->read_tempreg(data->pdev, &regval);
+ 	temp = (regval >> CUR_TEMP_SHIFT) * 125;
+@@ -139,118 +140,108 @@ static unsigned int get_raw_temp(struct k10temp_data *data)
+ 	return temp;
+ }
+ 
+-static ssize_t temp1_input_show(struct device *dev,
+-				struct device_attribute *attr, char *buf)
+-{
+-	struct k10temp_data *data = dev_get_drvdata(dev);
+-	unsigned int temp = get_raw_temp(data);
+-
+-	if (temp > data->temp_offset)
+-		temp -= data->temp_offset;
+-	else
+-		temp = 0;
+-
+-	return sprintf(buf, "%u\n", temp);
+-}
+-
+-static ssize_t temp2_input_show(struct device *dev,
+-				struct device_attribute *devattr, char *buf)
+-{
+-	struct k10temp_data *data = dev_get_drvdata(dev);
+-	unsigned int temp = get_raw_temp(data);
+-
+-	return sprintf(buf, "%u\n", temp);
+-}
+-
+-static ssize_t temp_label_show(struct device *dev,
+-			       struct device_attribute *devattr, char *buf)
+-{
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-
+-	return sprintf(buf, "%s\n", attr->index ? "Tctl" : "Tdie");
+-}
++const char *k10temp_temp_label[] = {
++	"Tdie",
++	"Tctl",
++};
+ 
+-static ssize_t temp1_max_show(struct device *dev,
+-			      struct device_attribute *attr, char *buf)
++static int k10temp_read_labels(struct device *dev,
++			       enum hwmon_sensor_types type,
++			       u32 attr, int channel, const char **str)
+ {
+-	return sprintf(buf, "%d\n", 70 * 1000);
++	*str = k10temp_temp_label[channel];
++	return 0;
+ }
+ 
+-static ssize_t temp_crit_show(struct device *dev,
+-			      struct device_attribute *devattr, char *buf)
++static int k10temp_read(struct device *dev, enum hwmon_sensor_types type,
++			u32 attr, int channel, long *val)
+ {
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+ 	struct k10temp_data *data = dev_get_drvdata(dev);
+-	int show_hyst = attr->index;
+ 	u32 regval;
+-	int value;
+ 
+-	data->read_htcreg(data->pdev, &regval);
+-	value = ((regval >> 16) & 0x7f) * 500 + 52000;
+-	if (show_hyst)
+-		value -= ((regval >> 24) & 0xf) * 500;
+-	return sprintf(buf, "%d\n", value);
++	switch (attr) {
++	case hwmon_temp_input:
++		switch (channel) {
++		case 0:		/* Tdie */
++			*val = get_raw_temp(data) - data->temp_offset;
++			if (*val < 0)
++				*val = 0;
++			break;
++		case 1:		/* Tctl */
++			*val = get_raw_temp(data);
++			if (*val < 0)
++				*val = 0;
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++		break;
++	case hwmon_temp_max:
++		*val = 70 * 1000;
++		break;
++	case hwmon_temp_crit:
++		data->read_htcreg(data->pdev, &regval);
++		*val = ((regval >> 16) & 0x7f) * 500 + 52000;
++		break;
++	case hwmon_temp_crit_hyst:
++		data->read_htcreg(data->pdev, &regval);
++		*val = (((regval >> 16) & 0x7f)
++			- ((regval >> 24) & 0xf)) * 500 + 52000;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	return 0;
+ }
+ 
+-static DEVICE_ATTR_RO(temp1_input);
+-static DEVICE_ATTR_RO(temp1_max);
+-static SENSOR_DEVICE_ATTR_RO(temp1_crit, temp_crit, 0);
+-static SENSOR_DEVICE_ATTR_RO(temp1_crit_hyst, temp_crit, 1);
+-
+-static SENSOR_DEVICE_ATTR_RO(temp1_label, temp_label, 0);
+-static DEVICE_ATTR_RO(temp2_input);
+-static SENSOR_DEVICE_ATTR_RO(temp2_label, temp_label, 1);
+-
+-static umode_t k10temp_is_visible(struct kobject *kobj,
+-				  struct attribute *attr, int index)
++static umode_t k10temp_is_visible(const void *_data,
++				  enum hwmon_sensor_types type,
++				  u32 attr, int channel)
+ {
+-	struct device *dev = container_of(kobj, struct device, kobj);
+-	struct k10temp_data *data = dev_get_drvdata(dev);
++	const struct k10temp_data *data = _data;
+ 	struct pci_dev *pdev = data->pdev;
+ 	u32 reg;
+ 
+-	switch (index) {
+-	case 0 ... 1:	/* temp1_input, temp1_max */
+-	default:
+-		break;
+-	case 2 ... 3:	/* temp1_crit, temp1_crit_hyst */
+-		if (!data->read_htcreg)
+-			return 0;
+-
+-		pci_read_config_dword(pdev, REG_NORTHBRIDGE_CAPABILITIES,
+-				      &reg);
+-		if (!(reg & NB_CAP_HTC))
+-			return 0;
+-
+-		data->read_htcreg(data->pdev, &reg);
+-		if (!(reg & HTC_ENABLE))
+-			return 0;
+-		break;
+-	case 4 ... 6:	/* temp1_label, temp2_input, temp2_label */
+-		if (!data->show_tdie)
++	switch (type) {
++	case hwmon_temp:
++		switch (attr) {
++		case hwmon_temp_input:
++			if (channel && !data->show_tdie)
++				return 0;
++			break;
++		case hwmon_temp_max:
++			if (channel)
++				return 0;
++			break;
++		case hwmon_temp_crit:
++		case hwmon_temp_crit_hyst:
++			if (channel || !data->read_htcreg)
++				return 0;
++
++			pci_read_config_dword(pdev,
++					      REG_NORTHBRIDGE_CAPABILITIES,
++					      &reg);
++			if (!(reg & NB_CAP_HTC))
++				return 0;
++
++			data->read_htcreg(data->pdev, &reg);
++			if (!(reg & HTC_ENABLE))
++				return 0;
++			break;
++		case hwmon_temp_label:
++			if (!data->show_tdie)
++				return 0;
++			break;
++		default:
+ 			return 0;
++		}
+ 		break;
++	default:
++		return 0;
+ 	}
+-	return attr->mode;
++	return 0444;
+ }
+ 
+-static struct attribute *k10temp_attrs[] = {
+-	&dev_attr_temp1_input.attr,
+-	&dev_attr_temp1_max.attr,
+-	&sensor_dev_attr_temp1_crit.dev_attr.attr,
+-	&sensor_dev_attr_temp1_crit_hyst.dev_attr.attr,
+-	&sensor_dev_attr_temp1_label.dev_attr.attr,
+-	&dev_attr_temp2_input.attr,
+-	&sensor_dev_attr_temp2_label.dev_attr.attr,
+-	NULL
+-};
+-
+-static const struct attribute_group k10temp_group = {
+-	.attrs = k10temp_attrs,
+-	.is_visible = k10temp_is_visible,
+-};
+-__ATTRIBUTE_GROUPS(k10temp);
+-
+ static bool has_erratum_319(struct pci_dev *pdev)
+ {
+ 	u32 pkg_type, reg_dram_cfg;
+@@ -285,8 +276,27 @@ static bool has_erratum_319(struct pci_dev *pdev)
+ 	       (boot_cpu_data.x86_model == 4 && boot_cpu_data.x86_stepping <= 2);
+ }
+ 
+-static int k10temp_probe(struct pci_dev *pdev,
+-				   const struct pci_device_id *id)
++static const struct hwmon_channel_info *k10temp_info[] = {
++	HWMON_CHANNEL_INFO(temp,
++			   HWMON_T_INPUT | HWMON_T_MAX |
++			   HWMON_T_CRIT | HWMON_T_CRIT_HYST |
++			   HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL),
++	NULL
++};
++
++static const struct hwmon_ops k10temp_hwmon_ops = {
++	.is_visible = k10temp_is_visible,
++	.read = k10temp_read,
++	.read_string = k10temp_read_labels,
++};
++
++static const struct hwmon_chip_info k10temp_chip_info = {
++	.ops = &k10temp_hwmon_ops,
++	.info = k10temp_info,
++};
++
++static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	int unreliable = has_erratum_319(pdev);
+ 	struct device *dev = &pdev->dev;
+@@ -334,8 +344,9 @@ static int k10temp_probe(struct pci_dev *pdev,
+ 		}
+ 	}
+ 
+-	hwmon_dev = devm_hwmon_device_register_with_groups(dev, "k10temp", data,
+-							   k10temp_groups);
++	hwmon_dev = devm_hwmon_device_register_with_info(dev, "k10temp", data,
++							 &k10temp_chip_info,
++							 NULL);
+ 	return PTR_ERR_OR_ZERO(hwmon_dev);
+ }
+ 
+-- 
+cgit 1.2-0.3.lf.el7
+
+From c757938929c9e1de52e31400f673fac02e1f26bb Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Tue, 14 Jan 2020 17:40:12 -0800
+Subject: hwmon: (k10temp) Report temperatures per CPU die
+
+Zen2 reports reporting temperatures per CPU die (called Core Complex Dies,
+or CCD, by AMD). Add support for it to the k10temp driver.
+
+Tested-by: Brad Campbell <lists2009@fnarfbargle.com>
+Tested-by: Bernhard Gebetsberger <bernhard.gebetsberger@gmx.at>
+Tested-by: Holger Kiehl <holger.kiehl@dwd.de>
+Tested-by: Michael Larabel <michael@phoronix.com>
+Tested-by: Jonathan McDowell <noodles@earth.li>
+Tested-by: Ken Moffat <zarniwhoop73@googlemail.com>
+Tested-by: Darren Salt <devspam@moreofthesa.me.uk>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/k10temp.c | 80 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/hwmon/k10temp.c b/drivers/hwmon/k10temp.c
+index c45f6498a59b..0af096b061fa 100644
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@ -5,6 +5,12 @@
+  *
+  * Copyright (c) 2009 Clemens Ladisch <clemens@ladisch.de>
+  * Copyright (c) 2020 Guenter Roeck <linux@roeck-us.net>
++ *
++ * Implementation notes:
++ * - CCD1 and CCD2 register address information as well as the calculation to
++ *   convert raw register values is from https://github.com/ocerman/zenpower.
++ *   The information is not confirmed from chip datasheets, but experiments
++ *   suggest that it provides reasonable temperature values.
+  */
+ 
+ #include <linux/bitops.h>
+@@ -61,6 +67,8 @@ static DEFINE_MUTEX(nb_smu_ind_mutex);
+ 
+ /* F17h M01h Access througn SMN */
+ #define F17H_M01H_REPORTED_TEMP_CTRL_OFFSET	0x00059800
++#define F17H_M70H_CCD1_TEMP			0x00059954
++#define F17H_M70H_CCD2_TEMP			0x00059958
+ 
+ #define CUR_TEMP_SHIFT				21
+ #define CUR_TEMP_RANGE_SEL_MASK			BIT(19)
+@@ -72,6 +80,8 @@ struct k10temp_data {
+ 	int temp_offset;
+ 	u32 temp_adjust_mask;
+ 	bool show_tdie;
++	bool show_tccd1;
++	bool show_tccd2;
+ };
+ 
+ struct tctl_offset {
+@@ -143,6 +153,8 @@ static long get_raw_temp(struct k10temp_data *data)
+ const char *k10temp_temp_label[] = {
+ 	"Tdie",
+ 	"Tctl",
++	"Tccd1",
++	"Tccd2",
+ };
+ 
+ static int k10temp_read_labels(struct device *dev,
+@@ -172,6 +184,16 @@ static int k10temp_read(struct device *dev, enum hwmon_sensor_types type,
+ 			if (*val < 0)
+ 				*val = 0;
+ 			break;
++		case 2:		/* Tccd1 */
++			amd_smn_read(amd_pci_dev_to_node_id(data->pdev),
++				     F17H_M70H_CCD1_TEMP, &regval);
++			*val = (regval & 0xfff) * 125 - 305000;
++			break;
++		case 3:		/* Tccd2 */
++			amd_smn_read(amd_pci_dev_to_node_id(data->pdev),
++				     F17H_M70H_CCD2_TEMP, &regval);
++			*val = (regval & 0xfff) * 125 - 305000;
++			break;
+ 		default:
+ 			return -EOPNOTSUPP;
+ 		}
+@@ -206,8 +228,24 @@ static umode_t k10temp_is_visible(const void *_data,
+ 	case hwmon_temp:
+ 		switch (attr) {
+ 		case hwmon_temp_input:
+-			if (channel && !data->show_tdie)
++			switch (channel) {
++			case 0:		/* Tdie, or Tctl if we don't show it */
++				break;
++			case 1:		/* Tctl */
++				if (!data->show_tdie)
++					return 0;
++				break;
++			case 2:		/* Tccd1 */
++				if (!data->show_tccd1)
++					return 0;
++				break;
++			case 3:		/* Tccd2 */
++				if (!data->show_tccd2)
++					return 0;
++				break;
++			default:
+ 				return 0;
++			}
+ 			break;
+ 		case hwmon_temp_max:
+ 			if (channel)
+@@ -229,8 +267,24 @@ static umode_t k10temp_is_visible(const void *_data,
+ 				return 0;
+ 			break;
+ 		case hwmon_temp_label:
++			/* No labels if we don't show the die temperature */
+ 			if (!data->show_tdie)
+ 				return 0;
++			switch (channel) {
++			case 0:		/* Tdie */
++			case 1:		/* Tctl */
++				break;
++			case 2:		/* Tccd1 */
++				if (!data->show_tccd1)
++					return 0;
++				break;
++			case 3:		/* Tccd2 */
++				if (!data->show_tccd2)
++					return 0;
++				break;
++			default:
++				return 0;
++			}
+ 			break;
+ 		default:
+ 			return 0;
+@@ -281,6 +335,8 @@ static const struct hwmon_channel_info *k10temp_info[] = {
+ 			   HWMON_T_INPUT | HWMON_T_MAX |
+ 			   HWMON_T_CRIT | HWMON_T_CRIT_HYST |
+ 			   HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
+ 			   HWMON_T_INPUT | HWMON_T_LABEL),
+ 	NULL
+ };
+@@ -326,9 +382,31 @@ static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		data->read_htcreg = read_htcreg_nb_f15;
+ 		data->read_tempreg = read_tempreg_nb_f15;
+ 	} else if (boot_cpu_data.x86 == 0x17 || boot_cpu_data.x86 == 0x18) {
++		u32 regval;
++
+ 		data->temp_adjust_mask = CUR_TEMP_RANGE_SEL_MASK;
+ 		data->read_tempreg = read_tempreg_nb_f17;
+ 		data->show_tdie = true;
++
++		switch (boot_cpu_data.x86_model) {
++		case 0x1:	/* Zen */
++		case 0x8:	/* Zen+ */
++		case 0x11:	/* Zen APU */
++		case 0x18:	/* Zen+ APU */
++			break;
++		case 0x31:	/* Zen2 Threadripper */
++		case 0x71:	/* Zen2 */
++			amd_smn_read(amd_pci_dev_to_node_id(pdev),
++				     F17H_M70H_CCD1_TEMP, &regval);
++			if (regval & 0xfff)
++				data->show_tccd1 = true;
++
++			amd_smn_read(amd_pci_dev_to_node_id(pdev),
++				     F17H_M70H_CCD2_TEMP, &regval);
++			if (regval & 0xfff)
++				data->show_tccd2 = true;
++			break;
++		}
+ 	} else {
+ 		data->read_htcreg = read_htcreg_pci;
+ 		data->read_tempreg = read_tempreg_pci;
+-- 
+cgit 1.2-0.3.lf.el7
+
+From b00647c46c9d7f6ee1ff6aaf335906101755e614 Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Tue, 14 Jan 2020 17:54:05 -0800
+Subject: hwmon: (k10temp) Show core and SoC current and voltages on Ryzen CPUs
+
+Ryzen CPUs report core and SoC voltages and currents. Add support
+for it to the k10temp driver.
+
+For the time being, only report voltages and currents for Ryzen
+CPUs. Threadripper and EPYC appear to use a different mechanism.
+
+Tested-by: Brad Campbell <lists2009@fnarfbargle.com>
+Tested-by: Bernhard Gebetsberger <bernhard.gebetsberger@gmx.at>
+Tested-by: Holger Kiehl <holger.kiehl@dwd.de>
+Tested-by: Michael Larabel <michael@phoronix.com>
+Tested-by: Jonathan McDowell <noodles@earth.li>
+Tested-by: Ken Moffat <zarniwhoop73@googlemail.com>
+Tested-by: Darren Salt <devspam@moreofthesa.me.uk>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/k10temp.c | 134 ++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 131 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/hwmon/k10temp.c b/drivers/hwmon/k10temp.c
+index 0af096b061fa..b961e12c6f58 100644
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@ -11,6 +11,18 @@
+  *   convert raw register values is from https://github.com/ocerman/zenpower.
+  *   The information is not confirmed from chip datasheets, but experiments
+  *   suggest that it provides reasonable temperature values.
++ * - Register addresses to read chip voltage and current are also from
++ *   https://github.com/ocerman/zenpower, and not confirmed from chip
++ *   datasheets. Current calibration is board specific and not typically
++ *   shared by board vendors. For this reason, current values are
++ *   normalized to report 1A/LSB for core current and and 0.25A/LSB for SoC
++ *   current. Reported values can be adjusted using the sensors configuration
++ *   file.
++ * - It is unknown if the mechanism to read CCD1/CCD2 temperature as well as
++ *   current and voltage information works on higher-end Ryzen CPUs.
++ *   Information reported by Windows tools suggests that additional sensors
++ *   (both temperature and voltage/current) are supported, but their register
++ *   location is currently unknown.
+  */
+ 
+ #include <linux/bitops.h>
+@@ -70,9 +82,16 @@ static DEFINE_MUTEX(nb_smu_ind_mutex);
+ #define F17H_M70H_CCD1_TEMP			0x00059954
+ #define F17H_M70H_CCD2_TEMP			0x00059958
+ 
++#define F17H_M01H_SVI				0x0005A000
++#define F17H_M01H_SVI_TEL_PLANE0		(F17H_M01H_SVI + 0xc)
++#define F17H_M01H_SVI_TEL_PLANE1		(F17H_M01H_SVI + 0x10)
++
+ #define CUR_TEMP_SHIFT				21
+ #define CUR_TEMP_RANGE_SEL_MASK			BIT(19)
+ 
++#define CFACTOR_ICORE				1000000	/* 1A / LSB	*/
++#define CFACTOR_ISOC				250000	/* 0.25A / LSB	*/
++
+ struct k10temp_data {
+ 	struct pci_dev *pdev;
+ 	void (*read_htcreg)(struct pci_dev *pdev, u32 *regval);
+@@ -82,6 +101,9 @@ struct k10temp_data {
+ 	bool show_tdie;
+ 	bool show_tccd1;
+ 	bool show_tccd2;
++	u32 svi_addr[2];
++	bool show_current;
++	int cfactor[2];
+ };
+ 
+ struct tctl_offset {
+@@ -99,6 +121,16 @@ static const struct tctl_offset tctl_offset_table[] = {
+ 	{ 0x17, "AMD Ryzen Threadripper 29", 27000 }, /* 29{20,50,70,90}[W]X */
+ };
+ 
++static bool is_threadripper(void)
++{
++	return strstr(boot_cpu_data.x86_model_id, "Threadripper");
++}
++
++static bool is_epyc(void)
++{
++	return strstr(boot_cpu_data.x86_model_id, "EPYC");
++}
++
+ static void read_htcreg_pci(struct pci_dev *pdev, u32 *regval)
+ {
+ 	pci_read_config_dword(pdev, REG_HARDWARE_THERMAL_CONTROL, regval);
+@@ -157,16 +189,76 @@ const char *k10temp_temp_label[] = {
+ 	"Tccd2",
+ };
+ 
++const char *k10temp_in_label[] = {
++	"Vcore",
++	"Vsoc",
++};
++
++const char *k10temp_curr_label[] = {
++	"Icore",
++	"Isoc",
++};
++
+ static int k10temp_read_labels(struct device *dev,
+ 			       enum hwmon_sensor_types type,
+ 			       u32 attr, int channel, const char **str)
+ {
+-	*str = k10temp_temp_label[channel];
++	switch (type) {
++	case hwmon_temp:
++		*str = k10temp_temp_label[channel];
++		break;
++	case hwmon_in:
++		*str = k10temp_in_label[channel];
++		break;
++	case hwmon_curr:
++		*str = k10temp_curr_label[channel];
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
+ 	return 0;
+ }
+ 
+-static int k10temp_read(struct device *dev, enum hwmon_sensor_types type,
+-			u32 attr, int channel, long *val)
++static int k10temp_read_curr(struct device *dev, u32 attr, int channel,
++			     long *val)
++{
++	struct k10temp_data *data = dev_get_drvdata(dev);
++	u32 regval;
++
++	switch (attr) {
++	case hwmon_curr_input:
++		amd_smn_read(amd_pci_dev_to_node_id(data->pdev),
++			     data->svi_addr[channel], &regval);
++		*val = DIV_ROUND_CLOSEST(data->cfactor[channel] *
++					 (regval & 0xff),
++					 1000);
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	return 0;
++}
++
++static int k10temp_read_in(struct device *dev, u32 attr, int channel, long *val)
++{
++	struct k10temp_data *data = dev_get_drvdata(dev);
++	u32 regval;
++
++	switch (attr) {
++	case hwmon_in_input:
++		amd_smn_read(amd_pci_dev_to_node_id(data->pdev),
++			     data->svi_addr[channel], &regval);
++		regval = (regval >> 16) & 0xff;
++		*val = DIV_ROUND_CLOSEST(155000 - regval * 625, 100);
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	return 0;
++}
++
++static int k10temp_read_temp(struct device *dev, u32 attr, int channel,
++			     long *val)
+ {
+ 	struct k10temp_data *data = dev_get_drvdata(dev);
+ 	u32 regval;
+@@ -216,6 +308,21 @@ static int k10temp_read(struct device *dev, enum hwmon_sensor_types type,
+ 	return 0;
+ }
+ 
++static int k10temp_read(struct device *dev, enum hwmon_sensor_types type,
++			u32 attr, int channel, long *val)
++{
++	switch (type) {
++	case hwmon_temp:
++		return k10temp_read_temp(dev, attr, channel, val);
++	case hwmon_in:
++		return k10temp_read_in(dev, attr, channel, val);
++	case hwmon_curr:
++		return k10temp_read_curr(dev, attr, channel, val);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static umode_t k10temp_is_visible(const void *_data,
+ 				  enum hwmon_sensor_types type,
+ 				  u32 attr, int channel)
+@@ -290,6 +397,11 @@ static umode_t k10temp_is_visible(const void *_data,
+ 			return 0;
+ 		}
+ 		break;
++	case hwmon_in:
++	case hwmon_curr:
++		if (!data->show_current)
++			return 0;
++		break;
+ 	default:
+ 		return 0;
+ 	}
+@@ -338,6 +450,12 @@ static const struct hwmon_channel_info *k10temp_info[] = {
+ 			   HWMON_T_INPUT | HWMON_T_LABEL,
+ 			   HWMON_T_INPUT | HWMON_T_LABEL,
+ 			   HWMON_T_INPUT | HWMON_T_LABEL),
++	HWMON_CHANNEL_INFO(in,
++			   HWMON_I_INPUT | HWMON_I_LABEL,
++			   HWMON_I_INPUT | HWMON_I_LABEL),
++	HWMON_CHANNEL_INFO(curr,
++			   HWMON_C_INPUT | HWMON_C_LABEL,
++			   HWMON_C_INPUT | HWMON_C_LABEL),
+ 	NULL
+ };
+ 
+@@ -393,9 +511,19 @@ static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		case 0x8:	/* Zen+ */
+ 		case 0x11:	/* Zen APU */
+ 		case 0x18:	/* Zen+ APU */
++			data->show_current = !is_threadripper() && !is_epyc();
++			data->svi_addr[0] = F17H_M01H_SVI_TEL_PLANE0;
++			data->svi_addr[1] = F17H_M01H_SVI_TEL_PLANE1;
++			data->cfactor[0] = CFACTOR_ICORE;
++			data->cfactor[1] = CFACTOR_ISOC;
+ 			break;
+ 		case 0x31:	/* Zen2 Threadripper */
+ 		case 0x71:	/* Zen2 */
++			data->show_current = !is_threadripper() && !is_epyc();
++			data->cfactor[0] = CFACTOR_ICORE;
++			data->cfactor[1] = CFACTOR_ISOC;
++			data->svi_addr[0] = F17H_M01H_SVI_TEL_PLANE1;
++			data->svi_addr[1] = F17H_M01H_SVI_TEL_PLANE0;
+ 			amd_smn_read(amd_pci_dev_to_node_id(pdev),
+ 				     F17H_M70H_CCD1_TEMP, &regval);
+ 			if (regval & 0xfff)
+-- 
+cgit 1.2-0.3.lf.el7
+
+From 70831c8a91845434c3792b0c3ef966dc30741ec0 Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Fri, 17 Jan 2020 06:43:20 -0800
+Subject: hwmon: (k10temp) Don't show temperature limits on Ryzen (Zen) CPUs
+
+The maximum Tdie or Tctl is not published for Ryzen CPUs. What is
+known, however, is that the traditional value of 70 degrees C is no
+longer correct. On top of that, the limit applies to Tctl, not to Tdie.
+Displaying it in either context is meaningless, confusing, and wrong.
+Stop doing it.
+
+Tested-by: Brad Campbell <lists2009@fnarfbargle.com>
+Tested-by: Holger Kiehl <holger.kiehl@dwd.de>
+Tested-by: Michael Larabel <michael@phoronix.com>
+Tested-by: Jonathan McDowell <noodles@earth.li>
+Tested-by: Ken Moffat <zarniwhoop73@googlemail.com>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/k10temp.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/hwmon/k10temp.c b/drivers/hwmon/k10temp.c
+index b961e12c6f58..4a470b5195ee 100644
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@ -355,7 +355,7 @@ static umode_t k10temp_is_visible(const void *_data,
+ 			}
+ 			break;
+ 		case hwmon_temp_max:
+-			if (channel)
++			if (channel || data->show_tdie)
+ 				return 0;
+ 			break;
+ 		case hwmon_temp_crit:
+-- 
+cgit 1.2-0.3.lf.el7
+
+From 9c4a38f19ed2bda2df2765e98ed661daf61b2cb2 Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Tue, 21 Jan 2020 21:33:54 -0800
+Subject: hwmon: (k10temp) Add debugfs support
+
+Show thermal and SVI registers for Family 17h CPUs.
+
+Tested-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/k10temp.c | 78 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/hwmon/k10temp.c b/drivers/hwmon/k10temp.c
+index 4a470b5195ee..5e3f43594084 100644
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include <linux/bitops.h>
++#include <linux/debugfs.h>
+ #include <linux/err.h>
+ #include <linux/hwmon.h>
+ #include <linux/init.h>
+@@ -442,6 +443,76 @@ static bool has_erratum_319(struct pci_dev *pdev)
+ 	       (boot_cpu_data.x86_model == 4 && boot_cpu_data.x86_stepping <= 2);
+ }
+ 
++#ifdef CONFIG_DEBUG_FS
++
++static void k10temp_smn_regs_show(struct seq_file *s, struct pci_dev *pdev,
++				  u32 addr, int count)
++{
++	u32 reg;
++	int i;
++
++	for (i = 0; i < count; i++) {
++		if (!(i & 3))
++			seq_printf(s, "0x%06x: ", addr + i * 4);
++		amd_smn_read(amd_pci_dev_to_node_id(pdev), addr + i * 4, &reg);
++		seq_printf(s, "%08x ", reg);
++		if ((i & 3) == 3)
++			seq_puts(s, "\n");
++	}
++}
++
++static int svi_show(struct seq_file *s, void *unused)
++{
++	struct k10temp_data *data = s->private;
++
++	k10temp_smn_regs_show(s, data->pdev, F17H_M01H_SVI, 32);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(svi);
++
++static int thm_show(struct seq_file *s, void *unused)
++{
++	struct k10temp_data *data = s->private;
++
++	k10temp_smn_regs_show(s, data->pdev,
++			      F17H_M01H_REPORTED_TEMP_CTRL_OFFSET, 256);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(thm);
++
++static void k10temp_debugfs_cleanup(void *ddir)
++{
++	debugfs_remove_recursive(ddir);
++}
++
++static void k10temp_init_debugfs(struct k10temp_data *data)
++{
++	struct dentry *debugfs;
++	char name[32];
++
++	/* Only show debugfs data for Family 17h/18h CPUs */
++	if (!data->show_tdie)
++		return;
++
++	scnprintf(name, sizeof(name), "k10temp-%s", pci_name(data->pdev));
++
++	debugfs = debugfs_create_dir(name, NULL);
++	if (debugfs) {
++		debugfs_create_file("svi", 0444, debugfs, data, &svi_fops);
++		debugfs_create_file("thm", 0444, debugfs, data, &thm_fops);
++		devm_add_action_or_reset(&data->pdev->dev,
++					 k10temp_debugfs_cleanup, debugfs);
++	}
++}
++
++#else
++
++static void k10temp_init_debugfs(struct k10temp_data *data)
++{
++}
++
++#endif
++
+ static const struct hwmon_channel_info *k10temp_info[] = {
+ 	HWMON_CHANNEL_INFO(temp,
+ 			   HWMON_T_INPUT | HWMON_T_MAX |
+@@ -553,7 +624,12 @@ static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	hwmon_dev = devm_hwmon_device_register_with_info(dev, "k10temp", data,
+ 							 &k10temp_chip_info,
+ 							 NULL);
+-	return PTR_ERR_OR_ZERO(hwmon_dev);
++	if (IS_ERR(hwmon_dev))
++		return PTR_ERR(hwmon_dev);
++
++	k10temp_init_debugfs(data);
++
++	return 0;
+ }
+ 
+ static const struct pci_device_id k10temp_id_table[] = {
+-- 
+cgit 1.2-0.3.lf.el7
+
+From fd8bdb23b91876ac1e624337bb88dc1dcc21d67e Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Wed, 22 Jan 2020 18:41:18 -0800
+Subject: hwmon: (k10temp) Display up to eight sets of CCD temperatures
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In HWiNFO, we see support for Tccd1, Tccd3, Tccd5, and Tccd7 temperature
+sensors on Zen2 based Threadripper CPUs. Checking register maps on
+Threadripper 3970X confirms SMN register addresses and values for those
+sensors.
+
+Register values observed in an idle system:
+
+0x059950: 00000000 00000abc 00000000 00000ad8
+0x059960: 00000000 00000ade 00000000 00000ae4
+
+Under load:
+
+0x059950: 00000000 00000c02 00000000 00000c14
+0x059960: 00000000 00000c30 00000000 00000c22
+
+More analysis shows that EPYC CPUs support up to 8 CCD temperature
+sensors. EPYC 7601 supports three CCD temperature sensors. Unlike
+Zen2 CPUs, the register space in Zen1 CPUs supports a maximum of four
+sensors, so only search for a maximum of four sensors on Zen1 CPUs.
+
+On top of that, in thm_10_0_sh_mask.h in the Linux kernel, we find
+definitions for THM_DIE{1-3}_TEMP__VALID_MASK, set to 0x00000800, as well
+as matching SMN addresses. This lets us conclude that bit 11 of the
+respective registers is a valid bit. With this assumption, the temperature
+offset is now 49 degrees C. This conveniently matches the documented
+temperature offset for Tdie, again suggesting that above registers indeed
+report temperatures sensor values. Assume that bit 11 is indeed a valid
+bit, and add support for the additional sensors.
+
+With this patch applied, output from 3970X (idle) looks as follows:
+
+k10temp-pci-00c3
+Adapter: PCI adapter
+Tdie:         +55.9°C
+Tctl:         +55.9°C
+Tccd1:        +39.8°C
+Tccd3:        +43.8°C
+Tccd5:        +43.8°C
+Tccd7:        +44.8°C
+
+Tested-by: Michael Larabel <michael@phoronix.com>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ drivers/hwmon/k10temp.c | 82 ++++++++++++++++++++++++-------------------------
+ 1 file changed, 41 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/hwmon/k10temp.c b/drivers/hwmon/k10temp.c
+index 5e3f43594084..e39354ffe973 100644
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@ -7,7 +7,7 @@
+  * Copyright (c) 2020 Guenter Roeck <linux@roeck-us.net>
+  *
+  * Implementation notes:
+- * - CCD1 and CCD2 register address information as well as the calculation to
++ * - CCD register address information as well as the calculation to
+  *   convert raw register values is from https://github.com/ocerman/zenpower.
+  *   The information is not confirmed from chip datasheets, but experiments
+  *   suggest that it provides reasonable temperature values.
+@@ -18,11 +18,6 @@
+  *   normalized to report 1A/LSB for core current and and 0.25A/LSB for SoC
+  *   current. Reported values can be adjusted using the sensors configuration
+  *   file.
+- * - It is unknown if the mechanism to read CCD1/CCD2 temperature as well as
+- *   current and voltage information works on higher-end Ryzen CPUs.
+- *   Information reported by Windows tools suggests that additional sensors
+- *   (both temperature and voltage/current) are supported, but their register
+- *   location is currently unknown.
+  */
+ 
+ #include <linux/bitops.h>
+@@ -80,8 +75,10 @@ static DEFINE_MUTEX(nb_smu_ind_mutex);
+ 
+ /* F17h M01h Access througn SMN */
+ #define F17H_M01H_REPORTED_TEMP_CTRL_OFFSET	0x00059800
+-#define F17H_M70H_CCD1_TEMP			0x00059954
+-#define F17H_M70H_CCD2_TEMP			0x00059958
++
++#define F17H_M70H_CCD_TEMP(x)			(0x00059954 + ((x) * 4))
++#define F17H_M70H_CCD_TEMP_VALID		BIT(11)
++#define F17H_M70H_CCD_TEMP_MASK			GENMASK(10, 0)
+ 
+ #define F17H_M01H_SVI				0x0005A000
+ #define F17H_M01H_SVI_TEL_PLANE0		(F17H_M01H_SVI + 0xc)
+@@ -100,8 +97,7 @@ struct k10temp_data {
+ 	int temp_offset;
+ 	u32 temp_adjust_mask;
+ 	bool show_tdie;
+-	bool show_tccd1;
+-	bool show_tccd2;
++	u32 show_tccd;
+ 	u32 svi_addr[2];
+ 	bool show_current;
+ 	int cfactor[2];
+@@ -188,6 +184,12 @@ const char *k10temp_temp_label[] = {
+ 	"Tctl",
+ 	"Tccd1",
+ 	"Tccd2",
++	"Tccd3",
++	"Tccd4",
++	"Tccd5",
++	"Tccd6",
++	"Tccd7",
++	"Tccd8",
+ };
+ 
+ const char *k10temp_in_label[] = {
+@@ -277,15 +279,10 @@ static int k10temp_read_temp(struct device *dev, u32 attr, int channel,
+ 			if (*val < 0)
+ 				*val = 0;
+ 			break;
+-		case 2:		/* Tccd1 */
+-			amd_smn_read(amd_pci_dev_to_node_id(data->pdev),
+-				     F17H_M70H_CCD1_TEMP, &regval);
+-			*val = (regval & 0xfff) * 125 - 305000;
+-			break;
+-		case 3:		/* Tccd2 */
++		case 2 ... 9:		/* Tccd{1-8} */
+ 			amd_smn_read(amd_pci_dev_to_node_id(data->pdev),
+-				     F17H_M70H_CCD2_TEMP, &regval);
+-			*val = (regval & 0xfff) * 125 - 305000;
++				     F17H_M70H_CCD_TEMP(channel - 2), &regval);
++			*val = (regval & F17H_M70H_CCD_TEMP_MASK) * 125 - 49000;
+ 			break;
+ 		default:
+ 			return -EOPNOTSUPP;
+@@ -343,12 +340,8 @@ static umode_t k10temp_is_visible(const void *_data,
+ 				if (!data->show_tdie)
+ 					return 0;
+ 				break;
+-			case 2:		/* Tccd1 */
+-				if (!data->show_tccd1)
+-					return 0;
+-				break;
+-			case 3:		/* Tccd2 */
+-				if (!data->show_tccd2)
++			case 2 ... 9:		/* Tccd{1-8} */
++				if (!(data->show_tccd & BIT(channel - 2)))
+ 					return 0;
+ 				break;
+ 			default:
+@@ -382,12 +375,8 @@ static umode_t k10temp_is_visible(const void *_data,
+ 			case 0:		/* Tdie */
+ 			case 1:		/* Tctl */
+ 				break;
+-			case 2:		/* Tccd1 */
+-				if (!data->show_tccd1)
+-					return 0;
+-				break;
+-			case 3:		/* Tccd2 */
+-				if (!data->show_tccd2)
++			case 2 ... 9:		/* Tccd{1-8} */
++				if (!(data->show_tccd & BIT(channel - 2)))
+ 					return 0;
+ 				break;
+ 			default:
+@@ -520,6 +509,12 @@ static const struct hwmon_channel_info *k10temp_info[] = {
+ 			   HWMON_T_LABEL,
+ 			   HWMON_T_INPUT | HWMON_T_LABEL,
+ 			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
+ 			   HWMON_T_INPUT | HWMON_T_LABEL),
+ 	HWMON_CHANNEL_INFO(in,
+ 			   HWMON_I_INPUT | HWMON_I_LABEL,
+@@ -541,6 +536,20 @@ static const struct hwmon_chip_info k10temp_chip_info = {
+ 	.info = k10temp_info,
+ };
+ 
++static void k10temp_get_ccd_support(struct pci_dev *pdev,
++				    struct k10temp_data *data, int limit)
++{
++	u32 regval;
++	int i;
++
++	for (i = 0; i < limit; i++) {
++		amd_smn_read(amd_pci_dev_to_node_id(pdev),
++			     F17H_M70H_CCD_TEMP(i), &regval);
++		if (regval & F17H_M70H_CCD_TEMP_VALID)
++			data->show_tccd |= BIT(i);
++	}
++}
++
+ static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	int unreliable = has_erratum_319(pdev);
+@@ -571,8 +580,6 @@ static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		data->read_htcreg = read_htcreg_nb_f15;
+ 		data->read_tempreg = read_tempreg_nb_f15;
+ 	} else if (boot_cpu_data.x86 == 0x17 || boot_cpu_data.x86 == 0x18) {
+-		u32 regval;
+-
+ 		data->temp_adjust_mask = CUR_TEMP_RANGE_SEL_MASK;
+ 		data->read_tempreg = read_tempreg_nb_f17;
+ 		data->show_tdie = true;
+@@ -587,6 +594,7 @@ static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 			data->svi_addr[1] = F17H_M01H_SVI_TEL_PLANE1;
+ 			data->cfactor[0] = CFACTOR_ICORE;
+ 			data->cfactor[1] = CFACTOR_ISOC;
++			k10temp_get_ccd_support(pdev, data, 4);
+ 			break;
+ 		case 0x31:	/* Zen2 Threadripper */
+ 		case 0x71:	/* Zen2 */
+@@ -595,15 +603,7 @@ static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 			data->cfactor[1] = CFACTOR_ISOC;
+ 			data->svi_addr[0] = F17H_M01H_SVI_TEL_PLANE1;
+ 			data->svi_addr[1] = F17H_M01H_SVI_TEL_PLANE0;
+-			amd_smn_read(amd_pci_dev_to_node_id(pdev),
+-				     F17H_M70H_CCD1_TEMP, &regval);
+-			if (regval & 0xfff)
+-				data->show_tccd1 = true;
+-
+-			amd_smn_read(amd_pci_dev_to_node_id(pdev),
+-				     F17H_M70H_CCD2_TEMP, &regval);
+-			if (regval & 0xfff)
+-				data->show_tccd2 = true;
++			k10temp_get_ccd_support(pdev, data, 8);
+ 			break;
+ 		}
+ 	} else {
+-- 
+cgit 1.2-0.3.lf.el7
+
+From 5b46903d8bf372e563bf2150d46b87fff197a109 Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Thu, 28 Nov 2019 21:34:40 -0800
+Subject: hwmon: Driver for disk and solid state drives with temperature
+ sensors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reading the temperature of ATA drives has been supported for years
+by userspace tools such as smarttools or hddtemp. The downside of
+such tools is that they need to run with super-user privilege, that
+the temperatures are not reported by standard tools such as 'sensors'
+or 'libsensors', and that drive temperatures are not available for use
+in the kernel's thermal subsystem.
+
+This driver solves this problem by adding support for reading the
+temperature of ATA drives from the kernel using the hwmon API and
+by adding a temperature zone for each drive.
+
+With this driver, the hard disk temperature can be read using the
+unprivileged 'sensors' application:
+
+$ sensors drivetemp-scsi-1-0
+drivetemp-scsi-1-0
+Adapter: SCSI adapter
+temp1:        +23.0°C
+
+or directly from sysfs:
+
+$ grep . /sys/class/hwmon/hwmon9/{name,temp1_input}
+/sys/class/hwmon/hwmon9/name:drivetemp
+/sys/class/hwmon/hwmon9/temp1_input:23000
+
+If the drive supports SCT transport and reports temperature limits,
+those are reported as well.
+
+drivetemp-scsi-0-0
+Adapter: SCSI adapter
+temp1:        +27.0°C  (low  =  +0.0°C, high = +60.0°C)
+                       (crit low = -41.0°C, crit = +85.0°C)
+                       (lowest = +23.0°C, highest = +34.0°C)
+
+The driver attempts to use SCT Command Transport to read the drive
+temperature. If the SCT Command Transport feature set is not available,
+or if it does not report the drive temperature, drive temperatures may
+be readable through SMART attributes. Since SMART attributes are not well
+defined, this method is only used as fallback mechanism.
+
+Cc: Chris Healy <cphealy@gmail.com>
+Cc: Linus Walleij <linus.walleij@linaro.org>
+Cc: Martin K. Petersen <martin.petersen@oracle.com>
+Cc: Bart Van Assche <bvanassche@acm.org>
+Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+Tested-by: Linus Walleij <linus.walleij@linaro.org>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+---
+ Documentation/hwmon/drivetemp.rst |  52 ++++
+ Documentation/hwmon/index.rst     |   1 +
+ drivers/hwmon/Kconfig             |  10 +
+ drivers/hwmon/Makefile            |   1 +
+ drivers/hwmon/drivetemp.c         | 574 ++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 638 insertions(+)
+ create mode 100644 Documentation/hwmon/drivetemp.rst
+ create mode 100644 drivers/hwmon/drivetemp.c
+
+diff --git a/Documentation/hwmon/drivetemp.rst b/Documentation/hwmon/drivetemp.rst
+new file mode 100644
+index 000000000000..2d37d049247f
+--- /dev/null
++++ b/Documentation/hwmon/drivetemp.rst
+@@ -0,0 +1,52 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++Kernel driver drivetemp
++=======================
++
++
++References
++----------
++
++ANS T13/1699-D
++Information technology - AT Attachment 8 - ATA/ATAPI Command Set (ATA8-ACS)
++
++ANS Project T10/BSR INCITS 513
++Information technology - SCSI Primary Commands - 4 (SPC-4)
++
++ANS Project INCITS 557
++Information technology - SCSI / ATA Translation - 5 (SAT-5)
++
++
++Description
++-----------
++
++This driver supports reporting the temperature of disk and solid state
++drives with temperature sensors.
++
++If supported, it uses the ATA SCT Command Transport feature to read
++the current drive temperature and, if available, temperature limits
++as well as historic minimum and maximum temperatures. If SCT Command
++Transport is not supported, the driver uses SMART attributes to read
++the drive temperature.
++
++
++Sysfs entries
++-------------
++
++Only the temp1_input attribute is always available. Other attributes are
++available only if reported by the drive. All temperatures are reported in
++milli-degrees Celsius.
++
++=======================	=====================================================
++temp1_input		Current drive temperature
++temp1_lcrit		Minimum temperature limit. Operating the device below
++			this temperature may cause physical damage to the
++			device.
++temp1_min		Minimum recommended continuous operating limit
++temp1_max		Maximum recommended continuous operating temperature
++temp1_crit		Maximum temperature limit. Operating the device above
++			this temperature may cause physical damage to the
++			device.
++temp1_lowest		Minimum temperature seen this power cycle
++temp1_highest		Maximum temperature seen this power cycle
++=======================	=====================================================
+diff --git a/Documentation/hwmon/index.rst b/Documentation/hwmon/index.rst
+index 6f88af43eed6..682ef4dda89c 100644
+--- a/Documentation/hwmon/index.rst
++++ b/Documentation/hwmon/index.rst
+@@ -47,6 +47,7 @@ Hardware Monitoring Kernel Drivers
+    da9055
+    dell-smm-hwmon
+    dme1737
++   drivetemp
+    ds1621
+    ds620
+    emc1403
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+index e6e1b1008cdd..7ea61648ad16 100644
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -385,6 +385,16 @@ config SENSORS_ATXP1
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called atxp1.
+ 
++config SENSORS_DRIVETEMP
++	tristate "Hard disk drives with temperature sensors"
++	depends on SCSI && ATA
++	help
++	  If you say yes you get support for the temperature sensor on
++	  hard disk drives.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called satatemp.
++
+ config SENSORS_DS620
+ 	tristate "Dallas Semiconductor DS620"
+ 	depends on I2C
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+index 226a1182967a..f0f514f9cf24 100644
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -56,6 +56,7 @@ obj-$(CONFIG_SENSORS_DA9052_ADC)+= da9052-hwmon.o
+ obj-$(CONFIG_SENSORS_DA9055)+= da9055-hwmon.o
+ obj-$(CONFIG_SENSORS_DELL_SMM)	+= dell-smm-hwmon.o
+ obj-$(CONFIG_SENSORS_DME1737)	+= dme1737.o
++obj-$(CONFIG_SENSORS_DRIVETEMP)	+= drivetemp.o
+ obj-$(CONFIG_SENSORS_DS620)	+= ds620.o
+ obj-$(CONFIG_SENSORS_DS1621)	+= ds1621.o
+ obj-$(CONFIG_SENSORS_EMC1403)	+= emc1403.o
+diff --git a/drivers/hwmon/drivetemp.c b/drivers/hwmon/drivetemp.c
+new file mode 100644
+index 000000000000..370d0c74eb01
+--- /dev/null
++++ b/drivers/hwmon/drivetemp.c
+@@ -0,0 +1,574 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Hwmon client for disk and solid state drives with temperature sensors
++ * Copyright (C) 2019 Zodiac Inflight Innovations
++ *
++ * With input from:
++ *    Hwmon client for S.M.A.R.T. hard disk drives with temperature sensors.
++ *    (C) 2018 Linus Walleij
++ *
++ *    hwmon: Driver for SCSI/ATA temperature sensors
++ *    by Constantin Baranov <const@mimas.ru>, submitted September 2009
++ *
++ * This drive supports reporting the temperatire of SATA drives. It can be
++ * easily extended to report the temperature of SCSI drives.
++ *
++ * The primary means to read drive temperatures and temperature limits
++ * for ATA drives is the SCT Command Transport feature set as specified in
++ * ATA8-ACS.
++ * It can be used to read the current drive temperature, temperature limits,
++ * and historic minimum and maximum temperatures. The SCT Command Transport
++ * feature set is documented in "AT Attachment 8 - ATA/ATAPI Command Set
++ * (ATA8-ACS)".
++ *
++ * If the SCT Command Transport feature set is not available, drive temperatures
++ * may be readable through SMART attributes. Since SMART attributes are not well
++ * defined, this method is only used as fallback mechanism.
++ *
++ * There are three SMART attributes which may report drive temperatures.
++ * Those are defined as follows (from
++ * http://www.cropel.com/library/smart-attribute-list.aspx).
++ *
++ * 190	Temperature	Temperature, monitored by a sensor somewhere inside
++ *			the drive. Raw value typicaly holds the actual
++ *			temperature (hexadecimal) in its rightmost two digits.
++ *
++ * 194	Temperature	Temperature, monitored by a sensor somewhere inside
++ *			the drive. Raw value typicaly holds the actual
++ *			temperature (hexadecimal) in its rightmost two digits.
++ *
++ * 231	Temperature	Temperature, monitored by a sensor somewhere inside
++ *			the drive. Raw value typicaly holds the actual
++ *			temperature (hexadecimal) in its rightmost two digits.
++ *
++ * Wikipedia defines attributes a bit differently.
++ *
++ * 190	Temperature	Value is equal to (100-temp. °C), allowing manufacturer
++ *	Difference or	to set a minimum threshold which corresponds to a
++ *	Airflow		maximum temperature. This also follows the convention of
++ *	Temperature	100 being a best-case value and lower values being
++ *			undesirable. However, some older drives may instead
++ *			report raw Temperature (identical to 0xC2) or
++ *			Temperature minus 50 here.
++ * 194	Temperature or	Indicates the device temperature, if the appropriate
++ *	Temperature	sensor is fitted. Lowest byte of the raw value contains
++ *	Celsius		the exact temperature value (Celsius degrees).
++ * 231	Life Left	Indicates the approximate SSD life left, in terms of
++ *	(SSDs) or	program/erase cycles or available reserved blocks.
++ *	Temperature	A normalized value of 100 represents a new drive, with
++ *			a threshold value at 10 indicating a need for
++ *			replacement. A value of 0 may mean that the drive is
++ *			operating in read-only mode to allow data recovery.
++ *			Previously (pre-2010) occasionally used for Drive
++ *			Temperature (more typically reported at 0xC2).
++ *
++ * Common denominator is that the first raw byte reports the temperature
++ * in degrees C on almost all drives. Some drives may report a fractional
++ * temperature in the second raw byte.
++ *
++ * Known exceptions (from libatasmart):
++ * - SAMSUNG SV0412H and SAMSUNG SV1204H) report the temperature in 10th
++ *   degrees C in the first two raw bytes.
++ * - A few Maxtor drives report an unknown or bad value in attribute 194.
++ * - Certain Apple SSD drives report an unknown value in attribute 190.
++ *   Only certain firmware versions are affected.
++ *
++ * Those exceptions affect older ATA drives and are currently ignored.
++ * Also, the second raw byte (possibly reporting the fractional temperature)
++ * is currently ignored.
++ *
++ * Many drives also report temperature limits in additional SMART data raw
++ * bytes. The format of those is not well defined and varies widely.
++ * The driver does not currently attempt to report those limits.
++ *
++ * According to data in smartmontools, attribute 231 is rarely used to report
++ * drive temperatures. At the same time, several drives report SSD life left
++ * in attribute 231, but do not support temperature sensors. For this reason,
++ * attribute 231 is currently ignored.
++ *
++ * Following above definitions, temperatures are reported as follows.
++ *   If SCT Command Transport is supported, it is used to read the
++ *   temperature and, if available, temperature limits.
++ * - Otherwise, if SMART attribute 194 is supported, it is used to read
++ *   the temperature.
++ * - Otherwise, if SMART attribute 190 is supported, it is used to read
++ *   the temperature.
++ */
++
++#include <linux/ata.h>
++#include <linux/bits.h>
++#include <linux/device.h>
++#include <linux/hwmon.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <scsi/scsi_cmnd.h>
++#include <scsi/scsi_device.h>
++#include <scsi/scsi_driver.h>
++#include <scsi/scsi_proto.h>
++
++struct drivetemp_data {
++	struct list_head list;		/* list of instantiated devices */
++	struct mutex lock;		/* protect data buffer accesses */
++	struct scsi_device *sdev;	/* SCSI device */
++	struct device *dev;		/* instantiating device */
++	struct device *hwdev;		/* hardware monitoring device */
++	u8 smartdata[ATA_SECT_SIZE];	/* local buffer */
++	int (*get_temp)(struct drivetemp_data *st, u32 attr, long *val);
++	bool have_temp_lowest;		/* lowest temp in SCT status */
++	bool have_temp_highest;		/* highest temp in SCT status */
++	bool have_temp_min;		/* have min temp */
++	bool have_temp_max;		/* have max temp */
++	bool have_temp_lcrit;		/* have lower critical limit */
++	bool have_temp_crit;		/* have critical limit */
++	int temp_min;			/* min temp */
++	int temp_max;			/* max temp */
++	int temp_lcrit;			/* lower critical limit */
++	int temp_crit;			/* critical limit */
++};
++
++static LIST_HEAD(drivetemp_devlist);
++
++#define ATA_MAX_SMART_ATTRS	30
++#define SMART_TEMP_PROP_190	190
++#define SMART_TEMP_PROP_194	194
++
++#define SCT_STATUS_REQ_ADDR	0xe0
++#define  SCT_STATUS_VERSION_LOW		0	/* log byte offsets */
++#define  SCT_STATUS_VERSION_HIGH	1
++#define  SCT_STATUS_TEMP		200
++#define  SCT_STATUS_TEMP_LOWEST		201
++#define  SCT_STATUS_TEMP_HIGHEST	202
++#define SCT_READ_LOG_ADDR	0xe1
++#define  SMART_READ_LOG			0xd5
++#define  SMART_WRITE_LOG		0xd6
++
++#define INVALID_TEMP		0x80
++
++#define temp_is_valid(temp)	((temp) != INVALID_TEMP)
++#define temp_from_sct(temp)	(((s8)(temp)) * 1000)
++
++static inline bool ata_id_smart_supported(u16 *id)
++{
++	return id[ATA_ID_COMMAND_SET_1] & BIT(0);
++}
++
++static inline bool ata_id_smart_enabled(u16 *id)
++{
++	return id[ATA_ID_CFS_ENABLE_1] & BIT(0);
++}
++
++static int drivetemp_scsi_command(struct drivetemp_data *st,
++				 u8 ata_command, u8 feature,
++				 u8 lba_low, u8 lba_mid, u8 lba_high)
++{
++	u8 scsi_cmd[MAX_COMMAND_SIZE];
++	int data_dir;
++
++	memset(scsi_cmd, 0, sizeof(scsi_cmd));
++	scsi_cmd[0] = ATA_16;
++	if (ata_command == ATA_CMD_SMART && feature == SMART_WRITE_LOG) {
++		scsi_cmd[1] = (5 << 1);	/* PIO Data-out */
++		/*
++		 * No off.line or cc, write to dev, block count in sector count
++		 * field.
++		 */
++		scsi_cmd[2] = 0x06;
++		data_dir = DMA_TO_DEVICE;
++	} else {
++		scsi_cmd[1] = (4 << 1);	/* PIO Data-in */
++		/*
++		 * No off.line or cc, read from dev, block count in sector count
++		 * field.
++		 */
++		scsi_cmd[2] = 0x0e;
++		data_dir = DMA_FROM_DEVICE;
++	}
++	scsi_cmd[4] = feature;
++	scsi_cmd[6] = 1;	/* 1 sector */
++	scsi_cmd[8] = lba_low;
++	scsi_cmd[10] = lba_mid;
++	scsi_cmd[12] = lba_high;
++	scsi_cmd[14] = ata_command;
++
++	return scsi_execute_req(st->sdev, scsi_cmd, data_dir,
++				st->smartdata, ATA_SECT_SIZE, NULL, HZ, 5,
++				NULL);
++}
++
++static int drivetemp_ata_command(struct drivetemp_data *st, u8 feature,
++				 u8 select)
++{
++	return drivetemp_scsi_command(st, ATA_CMD_SMART, feature, select,
++				     ATA_SMART_LBAM_PASS, ATA_SMART_LBAH_PASS);
++}
++
++static int drivetemp_get_smarttemp(struct drivetemp_data *st, u32 attr,
++				  long *temp)
++{
++	u8 *buf = st->smartdata;
++	bool have_temp = false;
++	u8 temp_raw;
++	u8 csum;
++	int err;
++	int i;
++
++	err = drivetemp_ata_command(st, ATA_SMART_READ_VALUES, 0);
++	if (err)
++		return err;
++
++	/* Checksum the read value table */
++	csum = 0;
++	for (i = 0; i < ATA_SECT_SIZE; i++)
++		csum += buf[i];
++	if (csum) {
++		dev_dbg(&st->sdev->sdev_gendev,
++			"checksum error reading SMART values\n");
++		return -EIO;
++	}
++
++	for (i = 0; i < ATA_MAX_SMART_ATTRS; i++) {
++		u8 *attr = buf + i * 12;
++		int id = attr[2];
++
++		if (!id)
++			continue;
++
++		if (id == SMART_TEMP_PROP_190) {
++			temp_raw = attr[7];
++			have_temp = true;
++		}
++		if (id == SMART_TEMP_PROP_194) {
++			temp_raw = attr[7];
++			have_temp = true;
++			break;
++		}
++	}
++
++	if (have_temp) {
++		*temp = temp_raw * 1000;
++		return 0;
++	}
++
++	return -ENXIO;
++}
++
++static int drivetemp_get_scttemp(struct drivetemp_data *st, u32 attr, long *val)
++{
++	u8 *buf = st->smartdata;
++	int err;
++
++	err = drivetemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ_ADDR);
++	if (err)
++		return err;
++	switch (attr) {
++	case hwmon_temp_input:
++		*val = temp_from_sct(buf[SCT_STATUS_TEMP]);
++		break;
++	case hwmon_temp_lowest:
++		*val = temp_from_sct(buf[SCT_STATUS_TEMP_LOWEST]);
++		break;
++	case hwmon_temp_highest:
++		*val = temp_from_sct(buf[SCT_STATUS_TEMP_HIGHEST]);
++		break;
++	default:
++		err = -EINVAL;
++		break;
++	}
++	return err;
++}
++
++static int drivetemp_identify_sata(struct drivetemp_data *st)
++{
++	struct scsi_device *sdev = st->sdev;
++	u8 *buf = st->smartdata;
++	struct scsi_vpd *vpd;
++	bool is_ata, is_sata;
++	bool have_sct_data_table;
++	bool have_sct_temp;
++	bool have_smart;
++	bool have_sct;
++	u16 *ata_id;
++	u16 version;
++	long temp;
++	int err;
++
++	/* SCSI-ATA Translation present? */
++	rcu_read_lock();
++	vpd = rcu_dereference(sdev->vpd_pg89);
++
++	/*
++	 * Verify that ATA IDENTIFY DEVICE data is included in ATA Information
++	 * VPD and that the drive implements the SATA protocol.
++	 */
++	if (!vpd || vpd->len < 572 || vpd->data[56] != ATA_CMD_ID_ATA ||
++	    vpd->data[36] != 0x34) {
++		rcu_read_unlock();
++		return -ENODEV;
++	}
++	ata_id = (u16 *)&vpd->data[60];
++	is_ata = ata_id_is_ata(ata_id);
++	is_sata = ata_id_is_sata(ata_id);
++	have_sct = ata_id_sct_supported(ata_id);
++	have_sct_data_table = ata_id_sct_data_tables(ata_id);
++	have_smart = ata_id_smart_supported(ata_id) &&
++				ata_id_smart_enabled(ata_id);
++
++	rcu_read_unlock();
++
++	/* bail out if this is not a SATA device */
++	if (!is_ata || !is_sata)
++		return -ENODEV;
++	if (!have_sct)
++		goto skip_sct;
++
++	err = drivetemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ_ADDR);
++	if (err)
++		goto skip_sct;
++
++	version = (buf[SCT_STATUS_VERSION_HIGH] << 8) |
++		  buf[SCT_STATUS_VERSION_LOW];
++	if (version != 2 && version != 3)
++		goto skip_sct;
++
++	have_sct_temp = temp_is_valid(buf[SCT_STATUS_TEMP]);
++	if (!have_sct_temp)
++		goto skip_sct;
++
++	st->have_temp_lowest = temp_is_valid(buf[SCT_STATUS_TEMP_LOWEST]);
++	st->have_temp_highest = temp_is_valid(buf[SCT_STATUS_TEMP_HIGHEST]);
++
++	if (!have_sct_data_table)
++		goto skip_sct;
++
++	/* Request and read temperature history table */
++	memset(buf, '\0', sizeof(st->smartdata));
++	buf[0] = 5;	/* data table command */
++	buf[2] = 1;	/* read table */
++	buf[4] = 2;	/* temperature history table */
++
++	err = drivetemp_ata_command(st, SMART_WRITE_LOG, SCT_STATUS_REQ_ADDR);
++	if (err)
++		goto skip_sct_data;
++
++	err = drivetemp_ata_command(st, SMART_READ_LOG, SCT_READ_LOG_ADDR);
++	if (err)
++		goto skip_sct_data;
++
++	/*
++	 * Temperature limits per AT Attachment 8 -
++	 * ATA/ATAPI Command Set (ATA8-ACS)
++	 */
++	st->have_temp_max = temp_is_valid(buf[6]);
++	st->have_temp_crit = temp_is_valid(buf[7]);
++	st->have_temp_min = temp_is_valid(buf[8]);
++	st->have_temp_lcrit = temp_is_valid(buf[9]);
++
++	st->temp_max = temp_from_sct(buf[6]);
++	st->temp_crit = temp_from_sct(buf[7]);
++	st->temp_min = temp_from_sct(buf[8]);
++	st->temp_lcrit = temp_from_sct(buf[9]);
++
++skip_sct_data:
++	if (have_sct_temp) {
++		st->get_temp = drivetemp_get_scttemp;
++		return 0;
++	}
++skip_sct:
++	if (!have_smart)
++		return -ENODEV;
++	st->get_temp = drivetemp_get_smarttemp;
++	return drivetemp_get_smarttemp(st, hwmon_temp_input, &temp);
++}
++
++static int drivetemp_identify(struct drivetemp_data *st)
++{
++	struct scsi_device *sdev = st->sdev;
++
++	/* Bail out immediately if there is no inquiry data */
++	if (!sdev->inquiry || sdev->inquiry_len < 16)
++		return -ENODEV;
++
++	/* Disk device? */
++	if (sdev->type != TYPE_DISK && sdev->type != TYPE_ZBC)
++		return -ENODEV;
++
++	return drivetemp_identify_sata(st);
++}
++
++static int drivetemp_read(struct device *dev, enum hwmon_sensor_types type,
++			 u32 attr, int channel, long *val)
++{
++	struct drivetemp_data *st = dev_get_drvdata(dev);
++	int err = 0;
++
++	if (type != hwmon_temp)
++		return -EINVAL;
++
++	switch (attr) {
++	case hwmon_temp_input:
++	case hwmon_temp_lowest:
++	case hwmon_temp_highest:
++		mutex_lock(&st->lock);
++		err = st->get_temp(st, attr, val);
++		mutex_unlock(&st->lock);
++		break;
++	case hwmon_temp_lcrit:
++		*val = st->temp_lcrit;
++		break;
++	case hwmon_temp_min:
++		*val = st->temp_min;
++		break;
++	case hwmon_temp_max:
++		*val = st->temp_max;
++		break;
++	case hwmon_temp_crit:
++		*val = st->temp_crit;
++		break;
++	default:
++		err = -EINVAL;
++		break;
++	}
++	return err;
++}
++
++static umode_t drivetemp_is_visible(const void *data,
++				   enum hwmon_sensor_types type,
++				   u32 attr, int channel)
++{
++	const struct drivetemp_data *st = data;
++
++	switch (type) {
++	case hwmon_temp:
++		switch (attr) {
++		case hwmon_temp_input:
++			return 0444;
++		case hwmon_temp_lowest:
++			if (st->have_temp_lowest)
++				return 0444;
++			break;
++		case hwmon_temp_highest:
++			if (st->have_temp_highest)
++				return 0444;
++			break;
++		case hwmon_temp_min:
++			if (st->have_temp_min)
++				return 0444;
++			break;
++		case hwmon_temp_max:
++			if (st->have_temp_max)
++				return 0444;
++			break;
++		case hwmon_temp_lcrit:
++			if (st->have_temp_lcrit)
++				return 0444;
++			break;
++		case hwmon_temp_crit:
++			if (st->have_temp_crit)
++				return 0444;
++			break;
++		default:
++			break;
++		}
++		break;
++	default:
++		break;
++	}
++	return 0;
++}
++
++static const struct hwmon_channel_info *drivetemp_info[] = {
++	HWMON_CHANNEL_INFO(chip,
++			   HWMON_C_REGISTER_TZ),
++	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT |
++			   HWMON_T_LOWEST | HWMON_T_HIGHEST |
++			   HWMON_T_MIN | HWMON_T_MAX |
++			   HWMON_T_LCRIT | HWMON_T_CRIT),
++	NULL
++};
++
++static const struct hwmon_ops drivetemp_ops = {
++	.is_visible = drivetemp_is_visible,
++	.read = drivetemp_read,
++};
++
++static const struct hwmon_chip_info drivetemp_chip_info = {
++	.ops = &drivetemp_ops,
++	.info = drivetemp_info,
++};
++
++/*
++ * The device argument points to sdev->sdev_dev. Its parent is
++ * sdev->sdev_gendev, which we can use to get the scsi_device pointer.
++ */
++static int drivetemp_add(struct device *dev, struct class_interface *intf)
++{
++	struct scsi_device *sdev = to_scsi_device(dev->parent);
++	struct drivetemp_data *st;
++	int err;
++
++	st = kzalloc(sizeof(*st), GFP_KERNEL);
++	if (!st)
++		return -ENOMEM;
++
++	st->sdev = sdev;
++	st->dev = dev;
++	mutex_init(&st->lock);
++
++	if (drivetemp_identify(st)) {
++		err = -ENODEV;
++		goto abort;
++	}
++
++	st->hwdev = hwmon_device_register_with_info(dev->parent, "drivetemp",
++						    st, &drivetemp_chip_info,
++						    NULL);
++	if (IS_ERR(st->hwdev)) {
++		err = PTR_ERR(st->hwdev);
++		goto abort;
++	}
++
++	list_add(&st->list, &drivetemp_devlist);
++	return 0;
++
++abort:
++	kfree(st);
++	return err;
++}
++
++static void drivetemp_remove(struct device *dev, struct class_interface *intf)
++{
++	struct drivetemp_data *st, *tmp;
++
++	list_for_each_entry_safe(st, tmp, &drivetemp_devlist, list) {
++		if (st->dev == dev) {
++			list_del(&st->list);
++			hwmon_device_unregister(st->hwdev);
++			kfree(st);
++			break;
++		}
++	}
++}
++
++static struct class_interface drivetemp_interface = {
++	.add_dev = drivetemp_add,
++	.remove_dev = drivetemp_remove,
++};
++
++static int __init drivetemp_init(void)
++{
++	return scsi_register_interface(&drivetemp_interface);
++}
++
++static void __exit drivetemp_exit(void)
++{
++	scsi_unregister_interface(&drivetemp_interface);
++}
++
++module_init(drivetemp_init);
++module_exit(drivetemp_exit);
++
++MODULE_AUTHOR("Guenter Roeck <linus@roeck-us.net>");
++MODULE_DESCRIPTION("Hard drive temperature monitor");
++MODULE_LICENSE("GPL");
+-- 
+cgit 1.2-0.3.lf.el7
+
