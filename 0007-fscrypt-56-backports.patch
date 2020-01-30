@@ -1,0 +1,3227 @@
+From 93edd392cad7485097c2e9068c764ae30083bb05 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Tue, 19 Nov 2019 14:24:47 -0800
+Subject: fscrypt: support passing a keyring key to FS_IOC_ADD_ENCRYPTION_KEY
+
+Extend the FS_IOC_ADD_ENCRYPTION_KEY ioctl to allow the raw key to be
+specified by a Linux keyring key, rather than specified directly.
+
+This is useful because fscrypt keys belong to a particular filesystem
+instance, so they are destroyed when that filesystem is unmounted.
+Usually this is desired.  But in some cases, userspace may need to
+unmount and re-mount the filesystem while keeping the keys, e.g. during
+a system update.  This requires keeping the keys somewhere else too.
+
+The keys could be kept in memory in a userspace daemon.  But depending
+on the security architecture and assumptions, it can be preferable to
+keep them only in kernel memory, where they are unreadable by userspace.
+
+We also can't solve this by going back to the original fscrypt API
+(where for each file, the master key was looked up in the process's
+keyring hierarchy) because that caused lots of problems of its own.
+
+Therefore, add the ability for FS_IOC_ADD_ENCRYPTION_KEY to accept a
+Linux keyring key.  This solves the problem by allowing userspace to (if
+needed) save the keys securely in a Linux keyring for re-provisioning,
+while still using the new fscrypt key management ioctls.
+
+This is analogous to how dm-crypt accepts a Linux keyring key, but the
+key is then stored internally in the dm-crypt data structures rather
+than being looked up again each time the dm-crypt device is accessed.
+
+Use a custom key type "fscrypt-provisioning" rather than one of the
+existing key types such as "logon".  This is strongly desired because it
+enforces that these keys are only usable for a particular purpose: for
+fscrypt as input to a particular KDF.  Otherwise, the keys could also be
+passed to any kernel API that accepts a "logon" key with any service
+prefix, e.g. dm-crypt, UBIFS, or (recently proposed) AF_ALG.  This would
+risk leaking information about the raw key despite it ostensibly being
+unreadable.  Of course, this mistake has already been made for multiple
+kernel APIs; but since this is a new API, let's do it right.
+
+This patch has been tested using an xfstest which I wrote to test it.
+
+Link: https://lore.kernel.org/r/20191119222447.226853-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ Documentation/filesystems/fscrypt.rst |  35 ++++++++-
+ fs/crypto/keyring.c                   | 132 +++++++++++++++++++++++++++++++---
+ include/uapi/linux/fscrypt.h          |  13 +++-
+ 3 files changed, 168 insertions(+), 12 deletions(-)
+
+diff --git a/Documentation/filesystems/fscrypt.rst b/Documentation/filesystems/fscrypt.rst
+index 68c2bc8275cf..9c53336d06a4 100644
+--- a/Documentation/filesystems/fscrypt.rst
++++ b/Documentation/filesystems/fscrypt.rst
+@@ -638,7 +638,8 @@ follows::
+     struct fscrypt_add_key_arg {
+             struct fscrypt_key_specifier key_spec;
+             __u32 raw_size;
+-            __u32 __reserved[9];
++            __u32 key_id;
++            __u32 __reserved[8];
+             __u8 raw[];
+     };
+ 
+@@ -655,6 +656,12 @@ follows::
+             } u;
+     };
+ 
++    struct fscrypt_provisioning_key_payload {
++            __u32 type;
++            __u32 __reserved;
++            __u8 raw[];
++    };
++
+ :c:type:`struct fscrypt_add_key_arg` must be zeroed, then initialized
+ as follows:
+ 
+@@ -677,9 +684,26 @@ as follows:
+   ``Documentation/security/keys/core.rst``).
+ 
+ - ``raw_size`` must be the size of the ``raw`` key provided, in bytes.
++  Alternatively, if ``key_id`` is nonzero, this field must be 0, since
++  in that case the size is implied by the specified Linux keyring key.
++
++- ``key_id`` is 0 if the raw key is given directly in the ``raw``
++  field.  Otherwise ``key_id`` is the ID of a Linux keyring key of
++  type "fscrypt-provisioning" whose payload is a :c:type:`struct
++  fscrypt_provisioning_key_payload` whose ``raw`` field contains the
++  raw key and whose ``type`` field matches ``key_spec.type``.  Since
++  ``raw`` is variable-length, the total size of this key's payload
++  must be ``sizeof(struct fscrypt_provisioning_key_payload)`` plus the
++  raw key size.  The process must have Search permission on this key.
++
++  Most users should leave this 0 and specify the raw key directly.
++  The support for specifying a Linux keyring key is intended mainly to
++  allow re-adding keys after a filesystem is unmounted and re-mounted,
++  without having to store the raw keys in userspace memory.
+ 
+ - ``raw`` is a variable-length field which must contain the actual
+-  key, ``raw_size`` bytes long.
++  key, ``raw_size`` bytes long.  Alternatively, if ``key_id`` is
++  nonzero, then this field is unused.
+ 
+ For v2 policy keys, the kernel keeps track of which user (identified
+ by effective user ID) added the key, and only allows the key to be
+@@ -701,11 +725,16 @@ FS_IOC_ADD_ENCRYPTION_KEY can fail with the following errors:
+ 
+ - ``EACCES``: FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR was specified, but the
+   caller does not have the CAP_SYS_ADMIN capability in the initial
+-  user namespace
++  user namespace; or the raw key was specified by Linux key ID but the
++  process lacks Search permission on the key.
+ - ``EDQUOT``: the key quota for this user would be exceeded by adding
+   the key
+ - ``EINVAL``: invalid key size or key specifier type, or reserved bits
+   were set
++- ``EKEYREJECTED``: the raw key was specified by Linux key ID, but the
++  key has the wrong type
++- ``ENOKEY``: the raw key was specified by Linux key ID, but no key
++  exists with that ID
+ - ``ENOTTY``: this type of filesystem does not implement encryption
+ - ``EOPNOTSUPP``: the kernel was not configured with encryption
+   support for this filesystem, or the filesystem superblock has not
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index 40cca351273f..098ff2e0f0bb 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -465,6 +465,109 @@ out_unlock:
+ 	return err;
+ }
+ 
++static int fscrypt_provisioning_key_preparse(struct key_preparsed_payload *prep)
++{
++	const struct fscrypt_provisioning_key_payload *payload = prep->data;
++
++	if (prep->datalen < sizeof(*payload) + FSCRYPT_MIN_KEY_SIZE ||
++	    prep->datalen > sizeof(*payload) + FSCRYPT_MAX_KEY_SIZE)
++		return -EINVAL;
++
++	if (payload->type != FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR &&
++	    payload->type != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER)
++		return -EINVAL;
++
++	if (payload->__reserved)
++		return -EINVAL;
++
++	prep->payload.data[0] = kmemdup(payload, prep->datalen, GFP_KERNEL);
++	if (!prep->payload.data[0])
++		return -ENOMEM;
++
++	prep->quotalen = prep->datalen;
++	return 0;
++}
++
++static void fscrypt_provisioning_key_free_preparse(
++					struct key_preparsed_payload *prep)
++{
++	kzfree(prep->payload.data[0]);
++}
++
++static void fscrypt_provisioning_key_describe(const struct key *key,
++					      struct seq_file *m)
++{
++	seq_puts(m, key->description);
++	if (key_is_positive(key)) {
++		const struct fscrypt_provisioning_key_payload *payload =
++			key->payload.data[0];
++
++		seq_printf(m, ": %u [%u]", key->datalen, payload->type);
++	}
++}
++
++static void fscrypt_provisioning_key_destroy(struct key *key)
++{
++	kzfree(key->payload.data[0]);
++}
++
++static struct key_type key_type_fscrypt_provisioning = {
++	.name			= "fscrypt-provisioning",
++	.preparse		= fscrypt_provisioning_key_preparse,
++	.free_preparse		= fscrypt_provisioning_key_free_preparse,
++	.instantiate		= generic_key_instantiate,
++	.describe		= fscrypt_provisioning_key_describe,
++	.destroy		= fscrypt_provisioning_key_destroy,
++};
++
++/*
++ * Retrieve the raw key from the Linux keyring key specified by 'key_id', and
++ * store it into 'secret'.
++ *
++ * The key must be of type "fscrypt-provisioning" and must have the field
++ * fscrypt_provisioning_key_payload::type set to 'type', indicating that it's
++ * only usable with fscrypt with the particular KDF version identified by
++ * 'type'.  We don't use the "logon" key type because there's no way to
++ * completely restrict the use of such keys; they can be used by any kernel API
++ * that accepts "logon" keys and doesn't require a specific service prefix.
++ *
++ * The ability to specify the key via Linux keyring key is intended for cases
++ * where userspace needs to re-add keys after the filesystem is unmounted and
++ * re-mounted.  Most users should just provide the raw key directly instead.
++ */
++static int get_keyring_key(u32 key_id, u32 type,
++			   struct fscrypt_master_key_secret *secret)
++{
++	key_ref_t ref;
++	struct key *key;
++	const struct fscrypt_provisioning_key_payload *payload;
++	int err;
++
++	ref = lookup_user_key(key_id, 0, KEY_NEED_SEARCH);
++	if (IS_ERR(ref))
++		return PTR_ERR(ref);
++	key = key_ref_to_ptr(ref);
++
++	if (key->type != &key_type_fscrypt_provisioning)
++		goto bad_key;
++	payload = key->payload.data[0];
++
++	/* Don't allow fscrypt v1 keys to be used as v2 keys and vice versa. */
++	if (payload->type != type)
++		goto bad_key;
++
++	secret->size = key->datalen - sizeof(*payload);
++	memcpy(secret->raw, payload->raw, secret->size);
++	err = 0;
++	goto out_put;
++
++bad_key:
++	err = -EKEYREJECTED;
++out_put:
++	key_ref_put(ref);
++	return err;
++}
++
+ /*
+  * Add a master encryption key to the filesystem, causing all files which were
+  * encrypted with it to appear "unlocked" (decrypted) when accessed.
+@@ -503,18 +606,25 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ 	if (!valid_key_spec(&arg.key_spec))
+ 		return -EINVAL;
+ 
+-	if (arg.raw_size < FSCRYPT_MIN_KEY_SIZE ||
+-	    arg.raw_size > FSCRYPT_MAX_KEY_SIZE)
+-		return -EINVAL;
+-
+ 	if (memchr_inv(arg.__reserved, 0, sizeof(arg.__reserved)))
+ 		return -EINVAL;
+ 
+ 	memset(&secret, 0, sizeof(secret));
+-	secret.size = arg.raw_size;
+-	err = -EFAULT;
+-	if (copy_from_user(secret.raw, uarg->raw, secret.size))
+-		goto out_wipe_secret;
++	if (arg.key_id) {
++		if (arg.raw_size != 0)
++			return -EINVAL;
++		err = get_keyring_key(arg.key_id, arg.key_spec.type, &secret);
++		if (err)
++			goto out_wipe_secret;
++	} else {
++		if (arg.raw_size < FSCRYPT_MIN_KEY_SIZE ||
++		    arg.raw_size > FSCRYPT_MAX_KEY_SIZE)
++			return -EINVAL;
++		secret.size = arg.raw_size;
++		err = -EFAULT;
++		if (copy_from_user(secret.raw, uarg->raw, secret.size))
++			goto out_wipe_secret;
++	}
+ 
+ 	switch (arg.key_spec.type) {
+ 	case FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR:
+@@ -978,8 +1088,14 @@ int __init fscrypt_init_keyring(void)
+ 	if (err)
+ 		goto err_unregister_fscrypt;
+ 
++	err = register_key_type(&key_type_fscrypt_provisioning);
++	if (err)
++		goto err_unregister_fscrypt_user;
++
+ 	return 0;
+ 
++err_unregister_fscrypt_user:
++	unregister_key_type(&key_type_fscrypt_user);
+ err_unregister_fscrypt:
+ 	unregister_key_type(&key_type_fscrypt);
+ 	return err;
+diff --git a/include/uapi/linux/fscrypt.h b/include/uapi/linux/fscrypt.h
+index 1beb174ad950..d5112a24e8b9 100644
+--- a/include/uapi/linux/fscrypt.h
++++ b/include/uapi/linux/fscrypt.h
+@@ -109,11 +109,22 @@ struct fscrypt_key_specifier {
+ 	} u;
+ };
+ 
++/*
++ * Payload of Linux keyring key of type "fscrypt-provisioning", referenced by
++ * fscrypt_add_key_arg::key_id as an alternative to fscrypt_add_key_arg::raw.
++ */
++struct fscrypt_provisioning_key_payload {
++	__u32 type;
++	__u32 __reserved;
++	__u8 raw[];
++};
++
+ /* Struct passed to FS_IOC_ADD_ENCRYPTION_KEY */
+ struct fscrypt_add_key_arg {
+ 	struct fscrypt_key_specifier key_spec;
+ 	__u32 raw_size;
+-	__u32 __reserved[9];
++	__u32 key_id;
++	__u32 __reserved[8];
+ 	__u8 raw[];
+ };
+ 
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 6e1adb88d230b08ad9a223ecaea1e6b238a9078f Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 12:38:10 -0800
+Subject: fscrypt: use crypto_skcipher_driver_name()
+
+Crypto API users shouldn't really be accessing struct skcipher_alg
+directly.  <crypto/skcipher.h> already has a function
+crypto_skcipher_driver_name(), so use that instead.
+
+No change in behavior.
+
+Link: https://lore.kernel.org/r/20191209203810.225302-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/keysetup.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/fs/crypto/keysetup.c b/fs/crypto/keysetup.c
+index f577bb6613f9..c9f4fe955971 100644
+--- a/fs/crypto/keysetup.c
++++ b/fs/crypto/keysetup.c
+@@ -89,8 +89,7 @@ struct crypto_skcipher *fscrypt_allocate_skcipher(struct fscrypt_mode *mode,
+ 		 * first time a mode is used.
+ 		 */
+ 		pr_info("fscrypt: %s using implementation \"%s\"\n",
+-			mode->friendly_name,
+-			crypto_skcipher_alg(tfm)->base.cra_driver_name);
++			mode->friendly_name, crypto_skcipher_driver_name(tfm));
+ 	}
+ 	crypto_skcipher_set_flags(tfm, CRYPTO_TFM_REQ_FORBID_WEAK_KEYS);
+ 	err = crypto_skcipher_setkey(tfm, raw_key, mode->keysize);
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From c64cfb989f008eed2622e822e90f2fcabd49d605 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 12:39:18 -0800
+Subject: fscrypt: verify that the crypto_skcipher has the correct ivsize
+
+As a sanity check, verify that the allocated crypto_skcipher actually
+has the ivsize that fscrypt is assuming it has.  This will always be the
+case unless there's a bug.  But if there ever is such a bug (e.g. like
+there was in earlier versions of the ESSIV conversion patch [1]) it's
+preferable for it to be immediately obvious, and not rely on the
+ciphertext verification tests failing due to uninitialized IV bytes.
+
+[1] https://lkml.kernel.org/linux-crypto/20190702215517.GA69157@gmail.com/
+
+Link: https://lore.kernel.org/r/20191209203918.225691-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/keysetup.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/fs/crypto/keysetup.c b/fs/crypto/keysetup.c
+index c9f4fe955971..39fdea79e912 100644
+--- a/fs/crypto/keysetup.c
++++ b/fs/crypto/keysetup.c
+@@ -91,6 +91,10 @@ struct crypto_skcipher *fscrypt_allocate_skcipher(struct fscrypt_mode *mode,
+ 		pr_info("fscrypt: %s using implementation \"%s\"\n",
+ 			mode->friendly_name, crypto_skcipher_driver_name(tfm));
+ 	}
++	if (WARN_ON(crypto_skcipher_ivsize(tfm) != mode->ivsize)) {
++		err = -EINVAL;
++		goto err_free_tfm;
++	}
+ 	crypto_skcipher_set_flags(tfm, CRYPTO_TFM_REQ_FORBID_WEAK_KEYS);
+ 	err = crypto_skcipher_setkey(tfm, raw_key, mode->keysize);
+ 	if (err)
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 2a5831b1d29754c216ad3b06a018c29e74d4ad10 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 12:40:54 -0800
+Subject: fscrypt: constify struct fscrypt_hkdf parameter to
+ fscrypt_hkdf_expand()
+
+Constify the struct fscrypt_hkdf parameter to fscrypt_hkdf_expand().
+This makes it clearer that struct fscrypt_hkdf contains the key only,
+not any per-request state.
+
+Link: https://lore.kernel.org/r/20191209204054.227736-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/fscrypt_private.h | 2 +-
+ fs/crypto/hkdf.c            | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index 130b50e5a011..23cef4d3793a 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -287,7 +287,7 @@ extern int fscrypt_init_hkdf(struct fscrypt_hkdf *hkdf, const u8 *master_key,
+ #define HKDF_CONTEXT_DIRECT_KEY		3
+ #define HKDF_CONTEXT_IV_INO_LBLK_64_KEY	4
+ 
+-extern int fscrypt_hkdf_expand(struct fscrypt_hkdf *hkdf, u8 context,
++extern int fscrypt_hkdf_expand(const struct fscrypt_hkdf *hkdf, u8 context,
+ 			       const u8 *info, unsigned int infolen,
+ 			       u8 *okm, unsigned int okmlen);
+ 
+diff --git a/fs/crypto/hkdf.c b/fs/crypto/hkdf.c
+index f21873e1b467..efb95bd19a89 100644
+--- a/fs/crypto/hkdf.c
++++ b/fs/crypto/hkdf.c
+@@ -112,7 +112,7 @@ out:
+  * adds to its application-specific info strings to guarantee that it doesn't
+  * accidentally repeat an info string when using HKDF for different purposes.)
+  */
+-int fscrypt_hkdf_expand(struct fscrypt_hkdf *hkdf, u8 context,
++int fscrypt_hkdf_expand(const struct fscrypt_hkdf *hkdf, u8 context,
+ 			const u8 *info, unsigned int infolen,
+ 			u8 *okm, unsigned int okmlen)
+ {
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 8a4ab0b866d8aba85b9899edebf14b87b25f817f Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 15 Dec 2019 13:39:47 -0800
+Subject: fscrypt: constify inode parameter to filename encryption functions
+
+Constify the struct inode parameter to fscrypt_fname_disk_to_usr() and
+the other filename encryption functions so that users don't have to pass
+in a non-const inode when they are dealing with a const one, as in [1].
+
+[1] https://lkml.kernel.org/linux-ext4/20191203051049.44573-6-drosen@google.com/
+
+Cc: Daniel Rosenberg <drosen@google.com>
+Link: https://lore.kernel.org/r/20191215213947.9521-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/fname.c           | 20 ++++++++++----------
+ fs/crypto/fscrypt_private.h |  2 +-
+ include/linux/fscrypt.h     |  8 +++++---
+ 3 files changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/fs/crypto/fname.c b/fs/crypto/fname.c
+index 3da3707c10e3..c87b71aa2353 100644
+--- a/fs/crypto/fname.c
++++ b/fs/crypto/fname.c
+@@ -34,12 +34,12 @@ static inline bool fscrypt_is_dot_dotdot(const struct qstr *str)
+  *
+  * Return: 0 on success, -errno on failure
+  */
+-int fname_encrypt(struct inode *inode, const struct qstr *iname,
++int fname_encrypt(const struct inode *inode, const struct qstr *iname,
+ 		  u8 *out, unsigned int olen)
+ {
+ 	struct skcipher_request *req = NULL;
+ 	DECLARE_CRYPTO_WAIT(wait);
+-	struct fscrypt_info *ci = inode->i_crypt_info;
++	const struct fscrypt_info *ci = inode->i_crypt_info;
+ 	struct crypto_skcipher *tfm = ci->ci_ctfm;
+ 	union fscrypt_iv iv;
+ 	struct scatterlist sg;
+@@ -85,14 +85,14 @@ int fname_encrypt(struct inode *inode, const struct qstr *iname,
+  *
+  * Return: 0 on success, -errno on failure
+  */
+-static int fname_decrypt(struct inode *inode,
+-				const struct fscrypt_str *iname,
+-				struct fscrypt_str *oname)
++static int fname_decrypt(const struct inode *inode,
++			 const struct fscrypt_str *iname,
++			 struct fscrypt_str *oname)
+ {
+ 	struct skcipher_request *req = NULL;
+ 	DECLARE_CRYPTO_WAIT(wait);
+ 	struct scatterlist src_sg, dst_sg;
+-	struct fscrypt_info *ci = inode->i_crypt_info;
++	const struct fscrypt_info *ci = inode->i_crypt_info;
+ 	struct crypto_skcipher *tfm = ci->ci_ctfm;
+ 	union fscrypt_iv iv;
+ 	int res;
+@@ -247,10 +247,10 @@ EXPORT_SYMBOL(fscrypt_fname_free_buffer);
+  *
+  * Return: 0 on success, -errno on failure
+  */
+-int fscrypt_fname_disk_to_usr(struct inode *inode,
+-			u32 hash, u32 minor_hash,
+-			const struct fscrypt_str *iname,
+-			struct fscrypt_str *oname)
++int fscrypt_fname_disk_to_usr(const struct inode *inode,
++			      u32 hash, u32 minor_hash,
++			      const struct fscrypt_str *iname,
++			      struct fscrypt_str *oname)
+ {
+ 	const struct qstr qname = FSTR_TO_QSTR(iname);
+ 	struct fscrypt_digested_name digested_name;
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index 23cef4d3793a..5792ecbd4d24 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -260,7 +260,7 @@ void fscrypt_generate_iv(union fscrypt_iv *iv, u64 lblk_num,
+ 			 const struct fscrypt_info *ci);
+ 
+ /* fname.c */
+-extern int fname_encrypt(struct inode *inode, const struct qstr *iname,
++extern int fname_encrypt(const struct inode *inode, const struct qstr *iname,
+ 			 u8 *out, unsigned int olen);
+ extern bool fscrypt_fname_encrypted_size(const struct inode *inode,
+ 					 u32 orig_len, u32 max_len,
+diff --git a/include/linux/fscrypt.h b/include/linux/fscrypt.h
+index 1a7bffe78ed5..6eaa729544a3 100644
+--- a/include/linux/fscrypt.h
++++ b/include/linux/fscrypt.h
+@@ -153,8 +153,10 @@ static inline void fscrypt_free_filename(struct fscrypt_name *fname)
+ extern int fscrypt_fname_alloc_buffer(const struct inode *, u32,
+ 				struct fscrypt_str *);
+ extern void fscrypt_fname_free_buffer(struct fscrypt_str *);
+-extern int fscrypt_fname_disk_to_usr(struct inode *, u32, u32,
+-			const struct fscrypt_str *, struct fscrypt_str *);
++extern int fscrypt_fname_disk_to_usr(const struct inode *inode,
++				     u32 hash, u32 minor_hash,
++				     const struct fscrypt_str *iname,
++				     struct fscrypt_str *oname);
+ 
+ #define FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE	32
+ 
+@@ -438,7 +440,7 @@ static inline void fscrypt_fname_free_buffer(struct fscrypt_str *crypto_str)
+ 	return;
+ }
+ 
+-static inline int fscrypt_fname_disk_to_usr(struct inode *inode,
++static inline int fscrypt_fname_disk_to_usr(const struct inode *inode,
+ 					    u32 hash, u32 minor_hash,
+ 					    const struct fscrypt_str *iname,
+ 					    struct fscrypt_str *oname)
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 2ebdef6d8c766ab7da532002091ad486f9db88ed Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 12:43:59 -0800
+Subject: fscrypt: move fscrypt_d_revalidate() to fname.c
+
+fscrypt_d_revalidate() and fscrypt_d_ops really belong in fname.c, since
+they're specific to filenames encryption.  crypto.c is for contents
+encryption and general fs/crypto/ initialization and utilities.
+
+Link: https://lore.kernel.org/r/20191209204359.228544-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/crypto.c          | 50 ---------------------------------------------
+ fs/crypto/fname.c           | 49 ++++++++++++++++++++++++++++++++++++++++++++
+ fs/crypto/fscrypt_private.h |  2 +-
+ 3 files changed, 50 insertions(+), 51 deletions(-)
+
+diff --git a/fs/crypto/crypto.c b/fs/crypto/crypto.c
+index 3719efa546c6..fcc6ca792ba2 100644
+--- a/fs/crypto/crypto.c
++++ b/fs/crypto/crypto.c
+@@ -25,8 +25,6 @@
+ #include <linux/module.h>
+ #include <linux/scatterlist.h>
+ #include <linux/ratelimit.h>
+-#include <linux/dcache.h>
+-#include <linux/namei.h>
+ #include <crypto/skcipher.h>
+ #include "fscrypt_private.h"
+ 
+@@ -286,54 +284,6 @@ int fscrypt_decrypt_block_inplace(const struct inode *inode, struct page *page,
+ }
+ EXPORT_SYMBOL(fscrypt_decrypt_block_inplace);
+ 
+-/*
+- * Validate dentries in encrypted directories to make sure we aren't potentially
+- * caching stale dentries after a key has been added.
+- */
+-static int fscrypt_d_revalidate(struct dentry *dentry, unsigned int flags)
+-{
+-	struct dentry *dir;
+-	int err;
+-	int valid;
+-
+-	/*
+-	 * Plaintext names are always valid, since fscrypt doesn't support
+-	 * reverting to ciphertext names without evicting the directory's inode
+-	 * -- which implies eviction of the dentries in the directory.
+-	 */
+-	if (!(dentry->d_flags & DCACHE_ENCRYPTED_NAME))
+-		return 1;
+-
+-	/*
+-	 * Ciphertext name; valid if the directory's key is still unavailable.
+-	 *
+-	 * Although fscrypt forbids rename() on ciphertext names, we still must
+-	 * use dget_parent() here rather than use ->d_parent directly.  That's
+-	 * because a corrupted fs image may contain directory hard links, which
+-	 * the VFS handles by moving the directory's dentry tree in the dcache
+-	 * each time ->lookup() finds the directory and it already has a dentry
+-	 * elsewhere.  Thus ->d_parent can be changing, and we must safely grab
+-	 * a reference to some ->d_parent to prevent it from being freed.
+-	 */
+-
+-	if (flags & LOOKUP_RCU)
+-		return -ECHILD;
+-
+-	dir = dget_parent(dentry);
+-	err = fscrypt_get_encryption_info(d_inode(dir));
+-	valid = !fscrypt_has_encryption_key(d_inode(dir));
+-	dput(dir);
+-
+-	if (err < 0)
+-		return err;
+-
+-	return valid;
+-}
+-
+-const struct dentry_operations fscrypt_d_ops = {
+-	.d_revalidate = fscrypt_d_revalidate,
+-};
+-
+ /**
+  * fscrypt_initialize() - allocate major buffers for fs encryption.
+  * @cop_flags:  fscrypt operations flags
+diff --git a/fs/crypto/fname.c b/fs/crypto/fname.c
+index c87b71aa2353..3fd27e14ebdd 100644
+--- a/fs/crypto/fname.c
++++ b/fs/crypto/fname.c
+@@ -11,6 +11,7 @@
+  * This has not yet undergone a rigorous security audit.
+  */
+ 
++#include <linux/namei.h>
+ #include <linux/scatterlist.h>
+ #include <crypto/skcipher.h>
+ #include "fscrypt_private.h"
+@@ -400,3 +401,51 @@ errout:
+ 	return ret;
+ }
+ EXPORT_SYMBOL(fscrypt_setup_filename);
++
++/*
++ * Validate dentries in encrypted directories to make sure we aren't potentially
++ * caching stale dentries after a key has been added.
++ */
++static int fscrypt_d_revalidate(struct dentry *dentry, unsigned int flags)
++{
++	struct dentry *dir;
++	int err;
++	int valid;
++
++	/*
++	 * Plaintext names are always valid, since fscrypt doesn't support
++	 * reverting to ciphertext names without evicting the directory's inode
++	 * -- which implies eviction of the dentries in the directory.
++	 */
++	if (!(dentry->d_flags & DCACHE_ENCRYPTED_NAME))
++		return 1;
++
++	/*
++	 * Ciphertext name; valid if the directory's key is still unavailable.
++	 *
++	 * Although fscrypt forbids rename() on ciphertext names, we still must
++	 * use dget_parent() here rather than use ->d_parent directly.  That's
++	 * because a corrupted fs image may contain directory hard links, which
++	 * the VFS handles by moving the directory's dentry tree in the dcache
++	 * each time ->lookup() finds the directory and it already has a dentry
++	 * elsewhere.  Thus ->d_parent can be changing, and we must safely grab
++	 * a reference to some ->d_parent to prevent it from being freed.
++	 */
++
++	if (flags & LOOKUP_RCU)
++		return -ECHILD;
++
++	dir = dget_parent(dentry);
++	err = fscrypt_get_encryption_info(d_inode(dir));
++	valid = !fscrypt_has_encryption_key(d_inode(dir));
++	dput(dir);
++
++	if (err < 0)
++		return err;
++
++	return valid;
++}
++
++const struct dentry_operations fscrypt_d_ops = {
++	.d_revalidate = fscrypt_d_revalidate,
++};
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index 5792ecbd4d24..37c418d23962 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -233,7 +233,6 @@ extern int fscrypt_crypt_block(const struct inode *inode,
+ 			       unsigned int len, unsigned int offs,
+ 			       gfp_t gfp_flags);
+ extern struct page *fscrypt_alloc_bounce_page(gfp_t gfp_flags);
+-extern const struct dentry_operations fscrypt_d_ops;
+ 
+ extern void __printf(3, 4) __cold
+ fscrypt_msg(const struct inode *inode, const char *level, const char *fmt, ...);
+@@ -265,6 +264,7 @@ extern int fname_encrypt(const struct inode *inode, const struct qstr *iname,
+ extern bool fscrypt_fname_encrypted_size(const struct inode *inode,
+ 					 u32 orig_len, u32 max_len,
+ 					 u32 *encrypted_len_ret);
++extern const struct dentry_operations fscrypt_d_ops;
+ 
+ /* hkdf.c */
+ 
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 56dce717950925f9d734b9e5621cbd41cbeb3e33 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 12:50:21 -0800
+Subject: fscrypt: introduce fscrypt_needs_contents_encryption()
+
+Add a function fscrypt_needs_contents_encryption() which takes an inode
+and returns true if it's an encrypted regular file and the kernel was
+built with fscrypt support.
+
+This will allow replacing duplicated checks of IS_ENCRYPTED() &&
+S_ISREG() on the I/O paths in ext4 and f2fs, while also optimizing out
+unneeded code when !CONFIG_FS_ENCRYPTION.
+
+Link: https://lore.kernel.org/r/20191209205021.231767-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ include/linux/fscrypt.h | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/include/linux/fscrypt.h b/include/linux/fscrypt.h
+index 6eaa729544a3..6fe8d0f96a4a 100644
+--- a/include/linux/fscrypt.h
++++ b/include/linux/fscrypt.h
+@@ -72,6 +72,21 @@ static inline bool fscrypt_has_encryption_key(const struct inode *inode)
+ 	return READ_ONCE(inode->i_crypt_info) != NULL;
+ }
+ 
++/**
++ * fscrypt_needs_contents_encryption() - check whether an inode needs
++ *					 contents encryption
++ *
++ * Return: %true iff the inode is an encrypted regular file and the kernel was
++ * built with fscrypt support.
++ *
++ * If you need to know whether the encrypt bit is set even when the kernel was
++ * built without fscrypt support, you must use IS_ENCRYPTED() directly instead.
++ */
++static inline bool fscrypt_needs_contents_encryption(const struct inode *inode)
++{
++	return IS_ENCRYPTED(inode) && S_ISREG(inode->i_mode);
++}
++
+ static inline bool fscrypt_dummy_context_enabled(struct inode *inode)
+ {
+ 	return inode->i_sb->s_cop->dummy_context &&
+@@ -269,6 +284,11 @@ static inline bool fscrypt_has_encryption_key(const struct inode *inode)
+ 	return false;
+ }
+ 
++static inline bool fscrypt_needs_contents_encryption(const struct inode *inode)
++{
++	return false;
++}
++
+ static inline bool fscrypt_dummy_context_enabled(struct inode *inode)
+ {
+ 	return false;
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 393a24a7956ce27d110b06bbd1674408ab8f6132 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 13:18:26 -0800
+Subject: fscrypt: split up fscrypt_supported_policy() by policy version
+
+Make fscrypt_supported_policy() call new functions
+fscrypt_supported_v1_policy() and fscrypt_supported_v2_policy(), to
+reduce the indentation level and make the code easier to read.
+
+Also adjust the function comment to mention that whether the encryption
+policy is supported can also depend on the inode.
+
+No change in behavior.
+
+Link: https://lore.kernel.org/r/20191209211829.239800-2-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/policy.c | 116 +++++++++++++++++++++++++++--------------------------
+ 1 file changed, 59 insertions(+), 57 deletions(-)
+
+diff --git a/fs/crypto/policy.c b/fs/crypto/policy.c
+index 96f528071bed..fdb13ce69cd2 100644
+--- a/fs/crypto/policy.c
++++ b/fs/crypto/policy.c
+@@ -63,13 +63,65 @@ static bool supported_iv_ino_lblk_64_policy(
+ 	return true;
+ }
+ 
++static bool fscrypt_supported_v1_policy(const struct fscrypt_policy_v1 *policy,
++					const struct inode *inode)
++{
++	if (!fscrypt_valid_enc_modes(policy->contents_encryption_mode,
++				     policy->filenames_encryption_mode)) {
++		fscrypt_warn(inode,
++			     "Unsupported encryption modes (contents %d, filenames %d)",
++			     policy->contents_encryption_mode,
++			     policy->filenames_encryption_mode);
++		return false;
++	}
++
++	if (policy->flags & ~(FSCRYPT_POLICY_FLAGS_PAD_MASK |
++			      FSCRYPT_POLICY_FLAG_DIRECT_KEY)) {
++		fscrypt_warn(inode, "Unsupported encryption flags (0x%02x)",
++			     policy->flags);
++		return false;
++	}
++
++	return true;
++}
++
++static bool fscrypt_supported_v2_policy(const struct fscrypt_policy_v2 *policy,
++					const struct inode *inode)
++{
++	if (!fscrypt_valid_enc_modes(policy->contents_encryption_mode,
++				     policy->filenames_encryption_mode)) {
++		fscrypt_warn(inode,
++			     "Unsupported encryption modes (contents %d, filenames %d)",
++			     policy->contents_encryption_mode,
++			     policy->filenames_encryption_mode);
++		return false;
++	}
++
++	if (policy->flags & ~FSCRYPT_POLICY_FLAGS_VALID) {
++		fscrypt_warn(inode, "Unsupported encryption flags (0x%02x)",
++			     policy->flags);
++		return false;
++	}
++
++	if ((policy->flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) &&
++	    !supported_iv_ino_lblk_64_policy(policy, inode))
++		return false;
++
++	if (memchr_inv(policy->__reserved, 0, sizeof(policy->__reserved))) {
++		fscrypt_warn(inode, "Reserved bits set in encryption policy");
++		return false;
++	}
++
++	return true;
++}
++
+ /**
+  * fscrypt_supported_policy - check whether an encryption policy is supported
+  *
+  * Given an encryption policy, check whether all its encryption modes and other
+- * settings are supported by this kernel.  (But we don't currently don't check
+- * for crypto API support here, so attempting to use an algorithm not configured
+- * into the crypto API will still fail later.)
++ * settings are supported by this kernel on the given inode.  (But we don't
++ * currently don't check for crypto API support here, so attempting to use an
++ * algorithm not configured into the crypto API will still fail later.)
+  *
+  * Return: %true if supported, else %false
+  */
+@@ -77,60 +129,10 @@ bool fscrypt_supported_policy(const union fscrypt_policy *policy_u,
+ 			      const struct inode *inode)
+ {
+ 	switch (policy_u->version) {
+-	case FSCRYPT_POLICY_V1: {
+-		const struct fscrypt_policy_v1 *policy = &policy_u->v1;
+-
+-		if (!fscrypt_valid_enc_modes(policy->contents_encryption_mode,
+-					     policy->filenames_encryption_mode)) {
+-			fscrypt_warn(inode,
+-				     "Unsupported encryption modes (contents %d, filenames %d)",
+-				     policy->contents_encryption_mode,
+-				     policy->filenames_encryption_mode);
+-			return false;
+-		}
+-
+-		if (policy->flags & ~(FSCRYPT_POLICY_FLAGS_PAD_MASK |
+-				      FSCRYPT_POLICY_FLAG_DIRECT_KEY)) {
+-			fscrypt_warn(inode,
+-				     "Unsupported encryption flags (0x%02x)",
+-				     policy->flags);
+-			return false;
+-		}
+-
+-		return true;
+-	}
+-	case FSCRYPT_POLICY_V2: {
+-		const struct fscrypt_policy_v2 *policy = &policy_u->v2;
+-
+-		if (!fscrypt_valid_enc_modes(policy->contents_encryption_mode,
+-					     policy->filenames_encryption_mode)) {
+-			fscrypt_warn(inode,
+-				     "Unsupported encryption modes (contents %d, filenames %d)",
+-				     policy->contents_encryption_mode,
+-				     policy->filenames_encryption_mode);
+-			return false;
+-		}
+-
+-		if (policy->flags & ~FSCRYPT_POLICY_FLAGS_VALID) {
+-			fscrypt_warn(inode,
+-				     "Unsupported encryption flags (0x%02x)",
+-				     policy->flags);
+-			return false;
+-		}
+-
+-		if ((policy->flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) &&
+-		    !supported_iv_ino_lblk_64_policy(policy, inode))
+-			return false;
+-
+-		if (memchr_inv(policy->__reserved, 0,
+-			       sizeof(policy->__reserved))) {
+-			fscrypt_warn(inode,
+-				     "Reserved bits set in encryption policy");
+-			return false;
+-		}
+-
+-		return true;
+-	}
++	case FSCRYPT_POLICY_V1:
++		return fscrypt_supported_v1_policy(&policy_u->v1, inode);
++	case FSCRYPT_POLICY_V2:
++		return fscrypt_supported_v2_policy(&policy_u->v2, inode);
+ 	}
+ 	return false;
+ }
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 85af90e57ce9697d36d479124e0bfffb145e39a4 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 13:18:27 -0800
+Subject: fscrypt: check for appropriate use of DIRECT_KEY flag earlier
+
+FSCRYPT_POLICY_FLAG_DIRECT_KEY is currently only allowed with Adiantum
+encryption.  But FS_IOC_SET_ENCRYPTION_POLICY allowed it in combination
+with other encryption modes, and an error wasn't reported until later
+when the encrypted directory was actually used.
+
+Fix it to report the error earlier by validating the correct use of the
+DIRECT_KEY flag in fscrypt_supported_policy(), similar to how we
+validate the IV_INO_LBLK_64 flag.
+
+Link: https://lore.kernel.org/r/20191209211829.239800-3-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/fscrypt_private.h |  6 +-----
+ fs/crypto/keysetup.c        | 14 ++++----------
+ fs/crypto/keysetup_v1.c     | 15 ---------------
+ fs/crypto/policy.c          | 30 ++++++++++++++++++++++++++++++
+ 4 files changed, 35 insertions(+), 30 deletions(-)
+
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index 37c418d23962..41b061cdf06e 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -448,11 +448,7 @@ struct fscrypt_mode {
+ 	int logged_impl_name;
+ };
+ 
+-static inline bool
+-fscrypt_mode_supports_direct_key(const struct fscrypt_mode *mode)
+-{
+-	return mode->ivsize >= offsetofend(union fscrypt_iv, nonce);
+-}
++extern struct fscrypt_mode fscrypt_modes[];
+ 
+ extern struct crypto_skcipher *
+ fscrypt_allocate_skcipher(struct fscrypt_mode *mode, const u8 *raw_key,
+diff --git a/fs/crypto/keysetup.c b/fs/crypto/keysetup.c
+index 39fdea79e912..96074054bdbc 100644
+--- a/fs/crypto/keysetup.c
++++ b/fs/crypto/keysetup.c
+@@ -13,7 +13,7 @@
+ 
+ #include "fscrypt_private.h"
+ 
+-static struct fscrypt_mode available_modes[] = {
++struct fscrypt_mode fscrypt_modes[] = {
+ 	[FSCRYPT_MODE_AES_256_XTS] = {
+ 		.friendly_name = "AES-256-XTS",
+ 		.cipher_str = "xts(aes)",
+@@ -51,10 +51,10 @@ select_encryption_mode(const union fscrypt_policy *policy,
+ 		       const struct inode *inode)
+ {
+ 	if (S_ISREG(inode->i_mode))
+-		return &available_modes[fscrypt_policy_contents_mode(policy)];
++		return &fscrypt_modes[fscrypt_policy_contents_mode(policy)];
+ 
+ 	if (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode))
+-		return &available_modes[fscrypt_policy_fnames_mode(policy)];
++		return &fscrypt_modes[fscrypt_policy_fnames_mode(policy)];
+ 
+ 	WARN_ONCE(1, "fscrypt: filesystem tried to load encryption info for inode %lu, which is not encryptable (file type %d)\n",
+ 		  inode->i_ino, (inode->i_mode & S_IFMT));
+@@ -129,7 +129,7 @@ static int setup_per_mode_key(struct fscrypt_info *ci,
+ 	const struct inode *inode = ci->ci_inode;
+ 	const struct super_block *sb = inode->i_sb;
+ 	struct fscrypt_mode *mode = ci->ci_mode;
+-	u8 mode_num = mode - available_modes;
++	const u8 mode_num = mode - fscrypt_modes;
+ 	struct crypto_skcipher *tfm, *prev_tfm;
+ 	u8 mode_key[FSCRYPT_MAX_KEY_SIZE];
+ 	u8 hkdf_info[sizeof(mode_num) + sizeof(sb->s_uuid)];
+@@ -189,12 +189,6 @@ static int fscrypt_setup_v2_file_key(struct fscrypt_info *ci,
+ 		 * This ensures that the master key is consistently used only
+ 		 * for HKDF, avoiding key reuse issues.
+ 		 */
+-		if (!fscrypt_mode_supports_direct_key(ci->ci_mode)) {
+-			fscrypt_warn(ci->ci_inode,
+-				     "Direct key flag not allowed with %s",
+-				     ci->ci_mode->friendly_name);
+-			return -EINVAL;
+-		}
+ 		return setup_per_mode_key(ci, mk, mk->mk_direct_tfms,
+ 					  HKDF_CONTEXT_DIRECT_KEY, false);
+ 	} else if (ci->ci_policy.v2.flags &
+diff --git a/fs/crypto/keysetup_v1.c b/fs/crypto/keysetup_v1.c
+index 5298ef22aa85..3578c1c607c5 100644
+--- a/fs/crypto/keysetup_v1.c
++++ b/fs/crypto/keysetup_v1.c
+@@ -253,23 +253,8 @@ err_free_dk:
+ static int setup_v1_file_key_direct(struct fscrypt_info *ci,
+ 				    const u8 *raw_master_key)
+ {
+-	const struct fscrypt_mode *mode = ci->ci_mode;
+ 	struct fscrypt_direct_key *dk;
+ 
+-	if (!fscrypt_mode_supports_direct_key(mode)) {
+-		fscrypt_warn(ci->ci_inode,
+-			     "Direct key mode not allowed with %s",
+-			     mode->friendly_name);
+-		return -EINVAL;
+-	}
+-
+-	if (ci->ci_policy.v1.contents_encryption_mode !=
+-	    ci->ci_policy.v1.filenames_encryption_mode) {
+-		fscrypt_warn(ci->ci_inode,
+-			     "Direct key mode not allowed with different contents and filenames modes");
+-		return -EINVAL;
+-	}
+-
+ 	dk = fscrypt_get_direct_key(ci, raw_master_key);
+ 	if (IS_ERR(dk))
+ 		return PTR_ERR(dk);
+diff --git a/fs/crypto/policy.c b/fs/crypto/policy.c
+index fdb13ce69cd2..e785b00f19b3 100644
+--- a/fs/crypto/policy.c
++++ b/fs/crypto/policy.c
+@@ -29,6 +29,26 @@ bool fscrypt_policies_equal(const union fscrypt_policy *policy1,
+ 	return !memcmp(policy1, policy2, fscrypt_policy_size(policy1));
+ }
+ 
++static bool supported_direct_key_modes(const struct inode *inode,
++				       u32 contents_mode, u32 filenames_mode)
++{
++	const struct fscrypt_mode *mode;
++
++	if (contents_mode != filenames_mode) {
++		fscrypt_warn(inode,
++			     "Direct key flag not allowed with different contents and filenames modes");
++		return false;
++	}
++	mode = &fscrypt_modes[contents_mode];
++
++	if (mode->ivsize < offsetofend(union fscrypt_iv, nonce)) {
++		fscrypt_warn(inode, "Direct key flag not allowed with %s",
++			     mode->friendly_name);
++		return false;
++	}
++	return true;
++}
++
+ static bool supported_iv_ino_lblk_64_policy(
+ 					const struct fscrypt_policy_v2 *policy,
+ 					const struct inode *inode)
+@@ -82,6 +102,11 @@ static bool fscrypt_supported_v1_policy(const struct fscrypt_policy_v1 *policy,
+ 		return false;
+ 	}
+ 
++	if ((policy->flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) &&
++	    !supported_direct_key_modes(inode, policy->contents_encryption_mode,
++					policy->filenames_encryption_mode))
++		return false;
++
+ 	return true;
+ }
+ 
+@@ -103,6 +128,11 @@ static bool fscrypt_supported_v2_policy(const struct fscrypt_policy_v2 *policy,
+ 		return false;
+ 	}
+ 
++	if ((policy->flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) &&
++	    !supported_direct_key_modes(inode, policy->contents_encryption_mode,
++					policy->filenames_encryption_mode))
++		return false;
++
+ 	if ((policy->flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) &&
+ 	    !supported_iv_ino_lblk_64_policy(policy, inode))
+ 		return false;
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From ef5b18b00bada6091fb531fb0c29cf0f7e1a3b85 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 13:18:28 -0800
+Subject: fscrypt: move fscrypt_valid_enc_modes() to policy.c
+
+fscrypt_valid_enc_modes() is only used by policy.c, so move it to there.
+
+Also adjust the order of the checks to be more natural, matching the
+numerical order of the constants and also keeping AES-256 (the
+recommended default) first in the list.
+
+No change in behavior.
+
+Link: https://lore.kernel.org/r/20191209211829.239800-4-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/fscrypt_private.h | 18 ------------------
+ fs/crypto/policy.c          | 17 +++++++++++++++++
+ 2 files changed, 17 insertions(+), 18 deletions(-)
+
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index 41b061cdf06e..71f496fe7173 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -206,24 +206,6 @@ typedef enum {
+ 	FS_ENCRYPT,
+ } fscrypt_direction_t;
+ 
+-static inline bool fscrypt_valid_enc_modes(u32 contents_mode,
+-					   u32 filenames_mode)
+-{
+-	if (contents_mode == FSCRYPT_MODE_AES_128_CBC &&
+-	    filenames_mode == FSCRYPT_MODE_AES_128_CTS)
+-		return true;
+-
+-	if (contents_mode == FSCRYPT_MODE_AES_256_XTS &&
+-	    filenames_mode == FSCRYPT_MODE_AES_256_CTS)
+-		return true;
+-
+-	if (contents_mode == FSCRYPT_MODE_ADIANTUM &&
+-	    filenames_mode == FSCRYPT_MODE_ADIANTUM)
+-		return true;
+-
+-	return false;
+-}
+-
+ /* crypto.c */
+ extern struct kmem_cache *fscrypt_info_cachep;
+ extern int fscrypt_initialize(unsigned int cop_flags);
+diff --git a/fs/crypto/policy.c b/fs/crypto/policy.c
+index e785b00f19b3..f1cff83c151a 100644
+--- a/fs/crypto/policy.c
++++ b/fs/crypto/policy.c
+@@ -29,6 +29,23 @@ bool fscrypt_policies_equal(const union fscrypt_policy *policy1,
+ 	return !memcmp(policy1, policy2, fscrypt_policy_size(policy1));
+ }
+ 
++static bool fscrypt_valid_enc_modes(u32 contents_mode, u32 filenames_mode)
++{
++	if (contents_mode == FSCRYPT_MODE_AES_256_XTS &&
++	    filenames_mode == FSCRYPT_MODE_AES_256_CTS)
++		return true;
++
++	if (contents_mode == FSCRYPT_MODE_AES_128_CBC &&
++	    filenames_mode == FSCRYPT_MODE_AES_128_CTS)
++		return true;
++
++	if (contents_mode == FSCRYPT_MODE_ADIANTUM &&
++	    filenames_mode == FSCRYPT_MODE_ADIANTUM)
++		return true;
++
++	return false;
++}
++
+ static bool supported_direct_key_modes(const struct inode *inode,
+ 				       u32 contents_mode, u32 filenames_mode)
+ {
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From b7e8d3d27edde7a05e195e0015bc6873f6263a30 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 13:18:29 -0800
+Subject: fscrypt: remove fscrypt_is_direct_key_policy()
+
+fscrypt_is_direct_key_policy() is no longer used, so remove it.
+
+Link: https://lore.kernel.org/r/20191209211829.239800-5-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/fscrypt_private.h | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index 71f496fe7173..b22e8decebed 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -136,12 +136,6 @@ fscrypt_policy_flags(const union fscrypt_policy *policy)
+ 	BUG();
+ }
+ 
+-static inline bool
+-fscrypt_is_direct_key_policy(const union fscrypt_policy *policy)
+-{
+-	return fscrypt_policy_flags(policy) & FSCRYPT_POLICY_FLAG_DIRECT_KEY;
+-}
+-
+ /**
+  * For encrypted symlinks, the ciphertext length is stored at the beginning
+  * of the string in little-endian format.
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 3b1ada55b905f306411f481df52b586cc8a407b8 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 13:23:48 -0800
+Subject: fscrypt: don't check for ENOKEY from fscrypt_get_encryption_info()
+
+fscrypt_get_encryption_info() returns 0 if the encryption key is
+unavailable; it never returns ENOKEY.  So remove checks for ENOKEY.
+
+Link: https://lore.kernel.org/r/20191209212348.243331-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/ext4/dir.c  | 2 +-
+ fs/f2fs/dir.c  | 2 +-
+ fs/ubifs/dir.c | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/fs/ext4/dir.c b/fs/ext4/dir.c
+index 9f00fc0bf21d..4e093277c8bf 100644
+--- a/fs/ext4/dir.c
++++ b/fs/ext4/dir.c
+@@ -120,7 +120,7 @@ static int ext4_readdir(struct file *file, struct dir_context *ctx)
+ 
+ 	if (IS_ENCRYPTED(inode)) {
+ 		err = fscrypt_get_encryption_info(inode);
+-		if (err && err != -ENOKEY)
++		if (err)
+ 			return err;
+ 	}
+ 
+diff --git a/fs/f2fs/dir.c b/fs/f2fs/dir.c
+index c967cacf979e..d9ad842945df 100644
+--- a/fs/f2fs/dir.c
++++ b/fs/f2fs/dir.c
+@@ -987,7 +987,7 @@ static int f2fs_readdir(struct file *file, struct dir_context *ctx)
+ 
+ 	if (IS_ENCRYPTED(inode)) {
+ 		err = fscrypt_get_encryption_info(inode);
+-		if (err && err != -ENOKEY)
++		if (err)
+ 			goto out;
+ 
+ 		err = fscrypt_fname_alloc_buffer(inode, F2FS_NAME_LEN, &fstr);
+diff --git a/fs/ubifs/dir.c b/fs/ubifs/dir.c
+index 0b98e3c8b461..acc4f942d25b 100644
+--- a/fs/ubifs/dir.c
++++ b/fs/ubifs/dir.c
+@@ -512,7 +512,7 @@ static int ubifs_readdir(struct file *file, struct dir_context *ctx)
+ 
+ 	if (encrypted) {
+ 		err = fscrypt_get_encryption_info(dir);
+-		if (err && err != -ENOKEY)
++		if (err)
+ 			return err;
+ 
+ 		err = fscrypt_fname_alloc_buffer(dir, UBIFS_MAX_NLEN, &fstr);
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From e933adde6f97c4b51d39250c1dad0e89bd3fb1c7 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Thu, 19 Dec 2019 10:56:24 -0800
+Subject: fscrypt: include <linux/ioctl.h> in UAPI header
+
+<linux/fscrypt.h> defines ioctl numbers using the macros like _IOWR()
+which are defined in <linux/ioctl.h>, so <linux/ioctl.h> should be
+included as a prerequisite, like it is in many other kernel headers.
+
+In practice this doesn't really matter since anyone referencing these
+ioctl numbers will almost certainly include <sys/ioctl.h> too in order
+to actually call ioctl().  But we might as well fix this.
+
+Link: https://lore.kernel.org/r/20191219185624.21251-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ include/uapi/linux/fscrypt.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/uapi/linux/fscrypt.h b/include/uapi/linux/fscrypt.h
+index d5112a24e8b9..0d8a6f47711c 100644
+--- a/include/uapi/linux/fscrypt.h
++++ b/include/uapi/linux/fscrypt.h
+@@ -8,6 +8,7 @@
+ #ifndef _UAPI_LINUX_FSCRYPT_H
+ #define _UAPI_LINUX_FSCRYPT_H
+ 
++#include <linux/ioctl.h>
+ #include <linux/types.h>
+ 
+ /* Encryption policy flags */
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From ede7a09fc8815011d67942e5b4a3cb1882b7bcd9 Mon Sep 17 00:00:00 2001
+From: Herbert Xu <herbert@gondor.apana.org.au>
+Date: Fri, 27 Dec 2019 10:47:00 +0800
+Subject: fscrypt: Allow modular crypto algorithms
+
+The commit 643fa9612bf1 ("fscrypt: remove filesystem specific
+build config option") removed modular support for fs/crypto.  This
+causes the Crypto API to be built-in whenever fscrypt is enabled.
+This makes it very difficult for me to test modular builds of
+the Crypto API without disabling fscrypt which is a pain.
+
+As fscrypt is still evolving and it's developing new ties with the
+fs layer, it's hard to build it as a module for now.
+
+However, the actual algorithms are not required until a filesystem
+is mounted.  Therefore we can allow them to be built as modules.
+
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Link: https://lore.kernel.org/r/20191227024700.7vrzuux32uyfdgum@gondor.apana.org.au
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/Kconfig | 21 ++++++++++++++-------
+ fs/ext4/Kconfig   |  1 +
+ fs/f2fs/Kconfig   |  1 +
+ fs/ubifs/Kconfig  |  1 +
+ 4 files changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/fs/crypto/Kconfig b/fs/crypto/Kconfig
+index ff5a1746cbae..02df95b44331 100644
+--- a/fs/crypto/Kconfig
++++ b/fs/crypto/Kconfig
+@@ -2,13 +2,8 @@
+ config FS_ENCRYPTION
+ 	bool "FS Encryption (Per-file encryption)"
+ 	select CRYPTO
+-	select CRYPTO_AES
+-	select CRYPTO_CBC
+-	select CRYPTO_ECB
+-	select CRYPTO_XTS
+-	select CRYPTO_CTS
+-	select CRYPTO_SHA512
+-	select CRYPTO_HMAC
++	select CRYPTO_HASH
++	select CRYPTO_SKCIPHER
+ 	select KEYS
+ 	help
+ 	  Enable encryption of files and directories.  This
+@@ -16,3 +11,15 @@ config FS_ENCRYPTION
+ 	  efficient since it avoids caching the encrypted and
+ 	  decrypted pages in the page cache.  Currently Ext4,
+ 	  F2FS and UBIFS make use of this feature.
++
++# Filesystems supporting encryption must select this if FS_ENCRYPTION.  This
++# allows the algorithms to be built as modules when all the filesystems are.
++config FS_ENCRYPTION_ALGS
++	tristate
++	select CRYPTO_AES
++	select CRYPTO_CBC
++	select CRYPTO_CTS
++	select CRYPTO_ECB
++	select CRYPTO_HMAC
++	select CRYPTO_SHA512
++	select CRYPTO_XTS
+diff --git a/fs/ext4/Kconfig b/fs/ext4/Kconfig
+index ef42ab040905..db9bfa08d3e0 100644
+--- a/fs/ext4/Kconfig
++++ b/fs/ext4/Kconfig
+@@ -39,6 +39,7 @@ config EXT4_FS
+ 	select CRYPTO
+ 	select CRYPTO_CRC32C
+ 	select FS_IOMAP
++	select FS_ENCRYPTION_ALGS if FS_ENCRYPTION
+ 	help
+ 	  This is the next generation of the ext3 filesystem.
+ 
+diff --git a/fs/f2fs/Kconfig b/fs/f2fs/Kconfig
+index 652fd2e2b23d..599fb9194c6a 100644
+--- a/fs/f2fs/Kconfig
++++ b/fs/f2fs/Kconfig
+@@ -6,6 +6,7 @@ config F2FS_FS
+ 	select CRYPTO
+ 	select CRYPTO_CRC32
+ 	select F2FS_FS_XATTR if FS_ENCRYPTION
++	select FS_ENCRYPTION_ALGS if FS_ENCRYPTION
+ 	help
+ 	  F2FS is based on Log-structured File System (LFS), which supports
+ 	  versatile "flash-friendly" features. The design has been focused on
+diff --git a/fs/ubifs/Kconfig b/fs/ubifs/Kconfig
+index 69932bcfa920..45d3d207fb99 100644
+--- a/fs/ubifs/Kconfig
++++ b/fs/ubifs/Kconfig
+@@ -12,6 +12,7 @@ config UBIFS_FS
+ 	select CRYPTO_ZSTD if UBIFS_FS_ZSTD
+ 	select CRYPTO_HASH_INFO
+ 	select UBIFS_FS_XATTR if FS_ENCRYPTION
++	select FS_ENCRYPTION_ALGS if FS_ENCRYPTION
+ 	depends on MTD_UBI
+ 	help
+ 	  UBIFS is a file system for flash devices which works on top of UBI.
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From f4a0b08b39ae9c81c827c06550579f4580bd82ac Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 12:45:09 -0800
+Subject: fscrypt: remove redundant bi_status check
+
+submit_bio_wait() already returns bi_status translated to an errno.
+So the additional check of bi_status is redundant and can be removed.
+
+Link: https://lore.kernel.org/r/20191209204509.228942-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/bio.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 1f4b8a277060..b88d417e186e 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -77,8 +77,6 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 			goto errout;
+ 		}
+ 		err = submit_bio_wait(bio);
+-		if (err == 0 && bio->bi_status)
+-			err = -EIO;
+ 		bio_put(bio);
+ 		if (err)
+ 			goto errout;
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 796f12d742653028a1520cce3a76035c86e2ebf9 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Thu, 26 Dec 2019 10:08:13 -0600
+Subject: fscrypt: optimize fscrypt_zeroout_range()
+
+Currently fscrypt_zeroout_range() issues and waits on a bio for each
+block it writes, which makes it very slow.
+
+Optimize it to write up to 16 pages at a time instead.
+
+Also add a function comment, and improve reliability by allowing the
+allocations of the bio and the first ciphertext page to wait on the
+corresponding mempools.
+
+Link: https://lore.kernel.org/r/20191226160813.53182-1-ebiggers@kernel.org
+Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/bio.c | 112 ++++++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 81 insertions(+), 31 deletions(-)
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index b88d417e186e..4fa18fff9c4e 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -41,51 +41,101 @@ void fscrypt_decrypt_bio(struct bio *bio)
+ }
+ EXPORT_SYMBOL(fscrypt_decrypt_bio);
+ 
++/**
++ * fscrypt_zeroout_range() - zero out a range of blocks in an encrypted file
++ * @inode: the file's inode
++ * @lblk: the first file logical block to zero out
++ * @pblk: the first filesystem physical block to zero out
++ * @len: number of blocks to zero out
++ *
++ * Zero out filesystem blocks in an encrypted regular file on-disk, i.e. write
++ * ciphertext blocks which decrypt to the all-zeroes block.  The blocks must be
++ * both logically and physically contiguous.  It's also assumed that the
++ * filesystem only uses a single block device, ->s_bdev.
++ *
++ * Note that since each block uses a different IV, this involves writing a
++ * different ciphertext to each block; we can't simply reuse the same one.
++ *
++ * Return: 0 on success; -errno on failure.
++ */
+ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+-				sector_t pblk, unsigned int len)
++			  sector_t pblk, unsigned int len)
+ {
+ 	const unsigned int blockbits = inode->i_blkbits;
+ 	const unsigned int blocksize = 1 << blockbits;
+-	struct page *ciphertext_page;
++	const unsigned int blocks_per_page_bits = PAGE_SHIFT - blockbits;
++	const unsigned int blocks_per_page = 1 << blocks_per_page_bits;
++	struct page *pages[16]; /* write up to 16 pages at a time */
++	unsigned int nr_pages;
++	unsigned int i;
++	unsigned int offset;
+ 	struct bio *bio;
+-	int ret, err = 0;
++	int ret, err;
+ 
+-	ciphertext_page = fscrypt_alloc_bounce_page(GFP_NOWAIT);
+-	if (!ciphertext_page)
+-		return -ENOMEM;
++	if (len == 0)
++		return 0;
+ 
+-	while (len--) {
+-		err = fscrypt_crypt_block(inode, FS_ENCRYPT, lblk,
+-					  ZERO_PAGE(0), ciphertext_page,
+-					  blocksize, 0, GFP_NOFS);
+-		if (err)
+-			goto errout;
++	BUILD_BUG_ON(ARRAY_SIZE(pages) > BIO_MAX_PAGES);
++	nr_pages = min_t(unsigned int, ARRAY_SIZE(pages),
++			 (len + blocks_per_page - 1) >> blocks_per_page_bits);
+ 
+-		bio = bio_alloc(GFP_NOWAIT, 1);
+-		if (!bio) {
+-			err = -ENOMEM;
+-			goto errout;
+-		}
++	/*
++	 * We need at least one page for ciphertext.  Allocate the first one
++	 * from a mempool, with __GFP_DIRECT_RECLAIM set so that it can't fail.
++	 *
++	 * Any additional page allocations are allowed to fail, as they only
++	 * help performance, and waiting on the mempool for them could deadlock.
++	 */
++	for (i = 0; i < nr_pages; i++) {
++		pages[i] = fscrypt_alloc_bounce_page(i == 0 ? GFP_NOFS :
++						     GFP_NOWAIT | __GFP_NOWARN);
++		if (!pages[i])
++			break;
++	}
++	nr_pages = i;
++	if (WARN_ON(nr_pages <= 0))
++		return -EINVAL;
++
++	/* This always succeeds since __GFP_DIRECT_RECLAIM is set. */
++	bio = bio_alloc(GFP_NOFS, nr_pages);
++
++	do {
+ 		bio_set_dev(bio, inode->i_sb->s_bdev);
+ 		bio->bi_iter.bi_sector = pblk << (blockbits - 9);
+ 		bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+-		ret = bio_add_page(bio, ciphertext_page, blocksize, 0);
+-		if (WARN_ON(ret != blocksize)) {
+-			/* should never happen! */
+-			bio_put(bio);
+-			err = -EIO;
+-			goto errout;
+-		}
++
++		i = 0;
++		offset = 0;
++		do {
++			err = fscrypt_crypt_block(inode, FS_ENCRYPT, lblk,
++						  ZERO_PAGE(0), pages[i],
++						  blocksize, offset, GFP_NOFS);
++			if (err)
++				goto out;
++			lblk++;
++			pblk++;
++			len--;
++			offset += blocksize;
++			if (offset == PAGE_SIZE || len == 0) {
++				ret = bio_add_page(bio, pages[i++], offset, 0);
++				if (WARN_ON(ret != offset)) {
++					err = -EIO;
++					goto out;
++				}
++				offset = 0;
++			}
++		} while (i != nr_pages && len != 0);
++
+ 		err = submit_bio_wait(bio);
+-		bio_put(bio);
+ 		if (err)
+-			goto errout;
+-		lblk++;
+-		pblk++;
+-	}
++			goto out;
++		bio_reset(bio);
++	} while (len != 0);
+ 	err = 0;
+-errout:
+-	fscrypt_free_bounce_page(ciphertext_page);
++out:
++	bio_put(bio);
++	for (i = 0; i < nr_pages; i++)
++		fscrypt_free_bounce_page(pages[i]);
+ 	return err;
+ }
+ EXPORT_SYMBOL(fscrypt_zeroout_range);
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 2d8f7f119b0b2ce5e7ff0e8024b0763bf42b99c9 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Tue, 31 Dec 2019 12:10:26 -0600
+Subject: fscrypt: document gfp_flags for bounce page allocation
+
+Document that fscrypt_encrypt_pagecache_blocks() allocates the bounce
+page from a mempool, and document what this means for the @gfp_flags
+argument.
+
+Link: https://lore.kernel.org/r/20191231181026.47400-1-ebiggers@kernel.org
+Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/crypto.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/fs/crypto/crypto.c b/fs/crypto/crypto.c
+index fcc6ca792ba2..1ecaac7ee3cb 100644
+--- a/fs/crypto/crypto.c
++++ b/fs/crypto/crypto.c
+@@ -138,7 +138,7 @@ int fscrypt_crypt_block(const struct inode *inode, fscrypt_direction_t rw,
+  *		multiple of the filesystem's block size.
+  * @offs:      Byte offset within @page of the first block to encrypt.  Must be
+  *		a multiple of the filesystem's block size.
+- * @gfp_flags: Memory allocation flags
++ * @gfp_flags: Memory allocation flags.  See details below.
+  *
+  * A new bounce page is allocated, and the specified block(s) are encrypted into
+  * it.  In the bounce page, the ciphertext block(s) will be located at the same
+@@ -148,6 +148,11 @@ int fscrypt_crypt_block(const struct inode *inode, fscrypt_direction_t rw,
+  *
+  * This is for use by the filesystem's ->writepages() method.
+  *
++ * The bounce page allocation is mempool-backed, so it will always succeed when
++ * @gfp_flags includes __GFP_DIRECT_RECLAIM, e.g. when it's GFP_NOFS.  However,
++ * only the first page of each bio can be allocated this way.  To prevent
++ * deadlocks, for any additional pages a mask like GFP_NOWAIT must be used.
++ *
+  * Return: the new encrypted bounce page on success; an ERR_PTR() on failure
+  */
+ struct page *fscrypt_encrypt_pagecache_blocks(struct page *page,
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 50d9fad73a45a78f8b974b46307712556c9a42d3 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 9 Dec 2019 13:27:21 -0800
+Subject: ubifs: use IS_ENCRYPTED() instead of ubifs_crypt_is_encrypted()
+
+There's no need for the ubifs_crypt_is_encrypted() function anymore.
+Just use IS_ENCRYPTED() instead, like ext4 and f2fs do.  IS_ENCRYPTED()
+checks the VFS-level flag instead of the UBIFS-specific flag, but it
+shouldn't change any behavior since the flags are kept in sync.
+
+Link: https://lore.kernel.org/r/20191209212721.244396-1-ebiggers@kernel.org
+Acked-by: Richard Weinberger <richard@nod.at>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/ubifs/dir.c     | 8 ++++----
+ fs/ubifs/file.c    | 4 ++--
+ fs/ubifs/journal.c | 6 +++---
+ fs/ubifs/ubifs.h   | 7 -------
+ 4 files changed, 9 insertions(+), 16 deletions(-)
+
+diff --git a/fs/ubifs/dir.c b/fs/ubifs/dir.c
+index acc4f942d25b..636c3222c230 100644
+--- a/fs/ubifs/dir.c
++++ b/fs/ubifs/dir.c
+@@ -81,7 +81,7 @@ struct inode *ubifs_new_inode(struct ubifs_info *c, struct inode *dir,
+ 	struct ubifs_inode *ui;
+ 	bool encrypted = false;
+ 
+-	if (ubifs_crypt_is_encrypted(dir)) {
++	if (IS_ENCRYPTED(dir)) {
+ 		err = fscrypt_get_encryption_info(dir);
+ 		if (err) {
+ 			ubifs_err(c, "fscrypt_get_encryption_info failed: %i", err);
+@@ -261,7 +261,7 @@ static struct dentry *ubifs_lookup(struct inode *dir, struct dentry *dentry,
+ 		goto done;
+ 	}
+ 
+-	if (ubifs_crypt_is_encrypted(dir) &&
++	if (IS_ENCRYPTED(dir) &&
+ 	    (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode)) &&
+ 	    !fscrypt_has_permitted_context(dir, inode)) {
+ 		ubifs_warn(c, "Inconsistent encryption contexts: %lu/%lu",
+@@ -499,7 +499,7 @@ static int ubifs_readdir(struct file *file, struct dir_context *ctx)
+ 	struct ubifs_dent_node *dent;
+ 	struct inode *dir = file_inode(file);
+ 	struct ubifs_info *c = dir->i_sb->s_fs_info;
+-	bool encrypted = ubifs_crypt_is_encrypted(dir);
++	bool encrypted = IS_ENCRYPTED(dir);
+ 
+ 	dbg_gen("dir ino %lu, f_pos %#llx", dir->i_ino, ctx->pos);
+ 
+@@ -1618,7 +1618,7 @@ int ubifs_getattr(const struct path *path, struct kstat *stat,
+ 
+ static int ubifs_dir_open(struct inode *dir, struct file *file)
+ {
+-	if (ubifs_crypt_is_encrypted(dir))
++	if (IS_ENCRYPTED(dir))
+ 		return fscrypt_get_encryption_info(dir) ? -EACCES : 0;
+ 
+ 	return 0;
+diff --git a/fs/ubifs/file.c b/fs/ubifs/file.c
+index cd52585c8f4f..c8e8f50c6054 100644
+--- a/fs/ubifs/file.c
++++ b/fs/ubifs/file.c
+@@ -67,7 +67,7 @@ static int read_block(struct inode *inode, void *addr, unsigned int block,
+ 
+ 	dlen = le32_to_cpu(dn->ch.len) - UBIFS_DATA_NODE_SZ;
+ 
+-	if (ubifs_crypt_is_encrypted(inode)) {
++	if (IS_ENCRYPTED(inode)) {
+ 		err = ubifs_decrypt(inode, dn, &dlen, block);
+ 		if (err)
+ 			goto dump;
+@@ -647,7 +647,7 @@ static int populate_page(struct ubifs_info *c, struct page *page,
+ 			dlen = le32_to_cpu(dn->ch.len) - UBIFS_DATA_NODE_SZ;
+ 			out_len = UBIFS_BLOCK_SIZE;
+ 
+-			if (ubifs_crypt_is_encrypted(inode)) {
++			if (IS_ENCRYPTED(inode)) {
+ 				err = ubifs_decrypt(inode, dn, &dlen, page_block);
+ 				if (err)
+ 					goto out_err;
+diff --git a/fs/ubifs/journal.c b/fs/ubifs/journal.c
+index 388fe8f5dc51..a38e18d3ef1d 100644
+--- a/fs/ubifs/journal.c
++++ b/fs/ubifs/journal.c
+@@ -727,7 +727,7 @@ int ubifs_jnl_write_data(struct ubifs_info *c, const struct inode *inode,
+ 	int dlen = COMPRESSED_DATA_NODE_BUF_SZ, allocated = 1;
+ 	int write_len;
+ 	struct ubifs_inode *ui = ubifs_inode(inode);
+-	bool encrypted = ubifs_crypt_is_encrypted(inode);
++	bool encrypted = IS_ENCRYPTED(inode);
+ 	u8 hash[UBIFS_HASH_ARR_SZ];
+ 
+ 	dbg_jnlk(key, "ino %lu, blk %u, len %d, key ",
+@@ -1449,7 +1449,7 @@ static int truncate_data_node(const struct ubifs_info *c, const struct inode *in
+ 	dlen = old_dlen = le32_to_cpu(dn->ch.len) - UBIFS_DATA_NODE_SZ;
+ 	compr_type = le16_to_cpu(dn->compr_type);
+ 
+-	if (ubifs_crypt_is_encrypted(inode)) {
++	if (IS_ENCRYPTED(inode)) {
+ 		err = ubifs_decrypt(inode, dn, &dlen, block);
+ 		if (err)
+ 			goto out;
+@@ -1465,7 +1465,7 @@ static int truncate_data_node(const struct ubifs_info *c, const struct inode *in
+ 		ubifs_compress(c, buf, *new_len, &dn->data, &out_len, &compr_type);
+ 	}
+ 
+-	if (ubifs_crypt_is_encrypted(inode)) {
++	if (IS_ENCRYPTED(inode)) {
+ 		err = ubifs_encrypt(inode, dn, out_len, &old_dlen, block);
+ 		if (err)
+ 			goto out;
+diff --git a/fs/ubifs/ubifs.h b/fs/ubifs/ubifs.h
+index c55f212dcb75..bff682309fbe 100644
+--- a/fs/ubifs/ubifs.h
++++ b/fs/ubifs/ubifs.h
+@@ -2095,13 +2095,6 @@ int ubifs_decrypt(const struct inode *inode, struct ubifs_data_node *dn,
+ 
+ extern const struct fscrypt_operations ubifs_crypt_operations;
+ 
+-static inline bool ubifs_crypt_is_encrypted(const struct inode *inode)
+-{
+-	const struct ubifs_inode *ui = ubifs_inode(inode);
+-
+-	return ui->flags & UBIFS_CRYPT_FL;
+-}
+-
+ /* Normal UBIFS messages */
+ __printf(2, 3)
+ void ubifs_msg(const struct ubifs_info *c, const char *fmt, ...);
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 13a10da94615d81087e718517794f2868a8b3fab Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 19 Jan 2020 22:07:32 -0800
+Subject: fscrypt: don't print name of busy file when removing key
+
+When an encryption key can't be fully removed due to file(s) protected
+by it still being in-use, we shouldn't really print the path to one of
+these files to the kernel log, since parts of this path are likely to be
+encrypted on-disk, and (depending on how the system is set up) the
+confidentiality of this path might be lost by printing it to the log.
+
+This is a trade-off: a single file path often doesn't matter at all,
+especially if it's a directory; the kernel log might still be protected
+in some way; and I had originally hoped that any "inode(s) still busy"
+bugs (which are security weaknesses in their own right) would be quickly
+fixed and that to do so it would be super helpful to always know the
+file path and not have to run 'find dir -inum $inum' after the fact.
+
+But in practice, these bugs can be hard to fix (e.g. due to asynchronous
+process killing that is difficult to eliminate, for performance
+reasons), and also not tied to specific files, so knowing a file path
+doesn't necessarily help.
+
+So to be safe, for now let's just show the inode number, not the path.
+If someone really wants to know a path they can use 'find -inum'.
+
+Fixes: b1c0ec3599f4 ("fscrypt: add FS_IOC_REMOVE_ENCRYPTION_KEY ioctl")
+Cc: <stable@vger.kernel.org> # v5.4+
+Link: https://lore.kernel.org/r/20200120060732.390362-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/keyring.c | 15 ++-------------
+ 1 file changed, 2 insertions(+), 13 deletions(-)
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index 098ff2e0f0bb..ab41b25d4fa1 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -776,9 +776,6 @@ static int check_for_busy_inodes(struct super_block *sb,
+ 	struct list_head *pos;
+ 	size_t busy_count = 0;
+ 	unsigned long ino;
+-	struct dentry *dentry;
+-	char _path[256];
+-	char *path = NULL;
+ 
+ 	spin_lock(&mk->mk_decrypted_inodes_lock);
+ 
+@@ -797,22 +794,14 @@ static int check_for_busy_inodes(struct super_block *sb,
+ 					 struct fscrypt_info,
+ 					 ci_master_key_link)->ci_inode;
+ 		ino = inode->i_ino;
+-		dentry = d_find_alias(inode);
+ 	}
+ 	spin_unlock(&mk->mk_decrypted_inodes_lock);
+ 
+-	if (dentry) {
+-		path = dentry_path(dentry, _path, sizeof(_path));
+-		dput(dentry);
+-	}
+-	if (IS_ERR_OR_NULL(path))
+-		path = "(unknown)";
+-
+ 	fscrypt_warn(NULL,
+-		     "%s: %zu inode(s) still busy after removing key with %s %*phN, including ino %lu (%s)",
++		     "%s: %zu inode(s) still busy after removing key with %s %*phN, including ino %lu",
+ 		     sb->s_id, busy_count, master_key_spec_type(&mk->mk_spec),
+ 		     master_key_spec_len(&mk->mk_spec), (u8 *)&mk->mk_spec.u,
+-		     ino, path);
++		     ino);
+ 	return -EBUSY;
+ }
+ 
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 1b3b827ee5230a73c8ed1b2cd8d53b4bd001268b Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 19 Jan 2020 23:17:36 -0800
+Subject: fscrypt: add "fscrypt_" prefix to fname_encrypt()
+
+fname_encrypt() is a global function, due to being used in both fname.c
+and hooks.c.  So it should be prefixed with "fscrypt_", like all the
+other global functions in fs/crypto/.
+
+Link: https://lore.kernel.org/r/20200120071736.45915-1-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/crypto/fname.c           | 10 +++++-----
+ fs/crypto/fscrypt_private.h |  5 +++--
+ fs/crypto/hooks.c           |  3 ++-
+ 3 files changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/fs/crypto/fname.c b/fs/crypto/fname.c
+index 3fd27e14ebdd..4614e4969736 100644
+--- a/fs/crypto/fname.c
++++ b/fs/crypto/fname.c
+@@ -28,15 +28,15 @@ static inline bool fscrypt_is_dot_dotdot(const struct qstr *str)
+ }
+ 
+ /**
+- * fname_encrypt() - encrypt a filename
++ * fscrypt_fname_encrypt() - encrypt a filename
+  *
+  * The output buffer must be at least as large as the input buffer.
+  * Any extra space is filled with NUL padding before encryption.
+  *
+  * Return: 0 on success, -errno on failure
+  */
+-int fname_encrypt(const struct inode *inode, const struct qstr *iname,
+-		  u8 *out, unsigned int olen)
++int fscrypt_fname_encrypt(const struct inode *inode, const struct qstr *iname,
++			  u8 *out, unsigned int olen)
+ {
+ 	struct skcipher_request *req = NULL;
+ 	DECLARE_CRYPTO_WAIT(wait);
+@@ -343,8 +343,8 @@ int fscrypt_setup_filename(struct inode *dir, const struct qstr *iname,
+ 		if (!fname->crypto_buf.name)
+ 			return -ENOMEM;
+ 
+-		ret = fname_encrypt(dir, iname, fname->crypto_buf.name,
+-				    fname->crypto_buf.len);
++		ret = fscrypt_fname_encrypt(dir, iname, fname->crypto_buf.name,
++					    fname->crypto_buf.len);
+ 		if (ret)
+ 			goto errout;
+ 		fname->disk_name.name = fname->crypto_buf.name;
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index b22e8decebed..fea7f5547428 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -235,8 +235,9 @@ void fscrypt_generate_iv(union fscrypt_iv *iv, u64 lblk_num,
+ 			 const struct fscrypt_info *ci);
+ 
+ /* fname.c */
+-extern int fname_encrypt(const struct inode *inode, const struct qstr *iname,
+-			 u8 *out, unsigned int olen);
++extern int fscrypt_fname_encrypt(const struct inode *inode,
++				 const struct qstr *iname,
++				 u8 *out, unsigned int olen);
+ extern bool fscrypt_fname_encrypted_size(const struct inode *inode,
+ 					 u32 orig_len, u32 max_len,
+ 					 u32 *encrypted_len_ret);
+diff --git a/fs/crypto/hooks.c b/fs/crypto/hooks.c
+index bb3b7fcfdd48..4081aae4bc35 100644
+--- a/fs/crypto/hooks.c
++++ b/fs/crypto/hooks.c
+@@ -188,7 +188,8 @@ int __fscrypt_encrypt_symlink(struct inode *inode, const char *target,
+ 	ciphertext_len = disk_link->len - sizeof(*sd);
+ 	sd->len = cpu_to_le16(ciphertext_len);
+ 
+-	err = fname_encrypt(inode, &iname, sd->encrypted_path, ciphertext_len);
++	err = fscrypt_fname_encrypt(inode, &iname, sd->encrypted_path,
++				    ciphertext_len);
+ 	if (err)
+ 		goto err_free_sd;
+ 
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From 6e1918cfb263acacd3fc9239127732b69de64695 Mon Sep 17 00:00:00 2001
+From: Daniel Rosenberg <drosen@google.com>
+Date: Mon, 20 Jan 2020 14:31:56 -0800
+Subject: fscrypt: don't allow v1 policies with casefolding
+
+Casefolded encrypted directories will use a new dirhash method that
+requires a secret key.  If the directory uses a v2 encryption policy,
+it's easy to derive this key from the master key using HKDF.  However,
+v1 encryption policies don't provide a way to derive additional keys.
+
+Therefore, don't allow casefolding on directories that use a v1 policy.
+Specifically, make it so that trying to enable casefolding on a
+directory that has a v1 policy fails, trying to set a v1 policy on a
+casefolded directory fails, and trying to open a casefolded directory
+that has a v1 policy (if one somehow exists on-disk) fails.
+
+Signed-off-by: Daniel Rosenberg <drosen@google.com>
+[EB: improved commit message, updated fscrypt.rst, and other cleanups]
+Link: https://lore.kernel.org/r/20200120223201.241390-2-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ Documentation/filesystems/fscrypt.rst |  4 +++-
+ fs/crypto/hooks.c                     | 28 ++++++++++++++++++++++++++++
+ fs/crypto/policy.c                    |  7 +++++++
+ fs/inode.c                            |  3 ++-
+ include/linux/fscrypt.h               |  9 +++++++++
+ 5 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/filesystems/fscrypt.rst b/Documentation/filesystems/fscrypt.rst
+index 9c53336d06a4..380a1be9550e 100644
+--- a/Documentation/filesystems/fscrypt.rst
++++ b/Documentation/filesystems/fscrypt.rst
+@@ -513,7 +513,9 @@ FS_IOC_SET_ENCRYPTION_POLICY can fail with the following errors:
+ - ``EEXIST``: the file is already encrypted with an encryption policy
+   different from the one specified
+ - ``EINVAL``: an invalid encryption policy was specified (invalid
+-  version, mode(s), or flags; or reserved bits were set)
++  version, mode(s), or flags; or reserved bits were set); or a v1
++  encryption policy was specified but the directory has the casefold
++  flag enabled (casefolding is incompatible with v1 policies).
+ - ``ENOKEY``: a v2 encryption policy was specified, but the key with
+   the specified ``master_key_identifier`` has not been added, nor does
+   the process have the CAP_FOWNER capability in the initial user
+diff --git a/fs/crypto/hooks.c b/fs/crypto/hooks.c
+index 4081aae4bc35..fd4e5ae21077 100644
+--- a/fs/crypto/hooks.c
++++ b/fs/crypto/hooks.c
+@@ -122,6 +122,34 @@ int __fscrypt_prepare_lookup(struct inode *dir, struct dentry *dentry,
+ }
+ EXPORT_SYMBOL_GPL(__fscrypt_prepare_lookup);
+ 
++/**
++ * fscrypt_prepare_setflags() - prepare to change flags with FS_IOC_SETFLAGS
++ * @inode: the inode on which flags are being changed
++ * @oldflags: the old flags
++ * @flags: the new flags
++ *
++ * The caller should be holding i_rwsem for write.
++ *
++ * Return: 0 on success; -errno if the flags change isn't allowed or if
++ *	   another error occurs.
++ */
++int fscrypt_prepare_setflags(struct inode *inode,
++			     unsigned int oldflags, unsigned int flags)
++{
++	struct fscrypt_info *ci;
++	int err;
++
++	if (IS_ENCRYPTED(inode) && (flags & ~oldflags & FS_CASEFOLD_FL)) {
++		err = fscrypt_require_key(inode);
++		if (err)
++			return err;
++		ci = inode->i_crypt_info;
++		if (ci->ci_policy.version != FSCRYPT_POLICY_V2)
++			return -EINVAL;
++	}
++	return 0;
++}
++
+ int __fscrypt_prepare_symlink(struct inode *dir, unsigned int len,
+ 			      unsigned int max_len,
+ 			      struct fscrypt_str *disk_link)
+diff --git a/fs/crypto/policy.c b/fs/crypto/policy.c
+index f1cff83c151a..cf2a9d26ef7d 100644
+--- a/fs/crypto/policy.c
++++ b/fs/crypto/policy.c
+@@ -124,6 +124,13 @@ static bool fscrypt_supported_v1_policy(const struct fscrypt_policy_v1 *policy,
+ 					policy->filenames_encryption_mode))
+ 		return false;
+ 
++	if (IS_CASEFOLDED(inode)) {
++		/* With v1, there's no way to derive dirhash keys. */
++		fscrypt_warn(inode,
++			     "v1 policies can't be used on casefolded directories");
++		return false;
++	}
++
+ 	return true;
+ }
+ 
+diff --git a/fs/inode.c b/fs/inode.c
+index 96d62d97694e..ea15c6d9f274 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -12,6 +12,7 @@
+ #include <linux/security.h>
+ #include <linux/cdev.h>
+ #include <linux/memblock.h>
++#include <linux/fscrypt.h>
+ #include <linux/fsnotify.h>
+ #include <linux/mount.h>
+ #include <linux/posix_acl.h>
+@@ -2252,7 +2253,7 @@ int vfs_ioc_setflags_prepare(struct inode *inode, unsigned int oldflags,
+ 	    !capable(CAP_LINUX_IMMUTABLE))
+ 		return -EPERM;
+ 
+-	return 0;
++	return fscrypt_prepare_setflags(inode, oldflags, flags);
+ }
+ EXPORT_SYMBOL(vfs_ioc_setflags_prepare);
+ 
+diff --git a/include/linux/fscrypt.h b/include/linux/fscrypt.h
+index 6fe8d0f96a4a..3984eadd7023 100644
+--- a/include/linux/fscrypt.h
++++ b/include/linux/fscrypt.h
+@@ -263,6 +263,8 @@ extern int __fscrypt_prepare_rename(struct inode *old_dir,
+ 				    unsigned int flags);
+ extern int __fscrypt_prepare_lookup(struct inode *dir, struct dentry *dentry,
+ 				    struct fscrypt_name *fname);
++extern int fscrypt_prepare_setflags(struct inode *inode,
++				    unsigned int oldflags, unsigned int flags);
+ extern int __fscrypt_prepare_symlink(struct inode *dir, unsigned int len,
+ 				     unsigned int max_len,
+ 				     struct fscrypt_str *disk_link);
+@@ -519,6 +521,13 @@ static inline int __fscrypt_prepare_lookup(struct inode *dir,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int fscrypt_prepare_setflags(struct inode *inode,
++					   unsigned int oldflags,
++					   unsigned int flags)
++{
++	return 0;
++}
++
+ static inline int __fscrypt_prepare_symlink(struct inode *dir,
+ 					    unsigned int len,
+ 					    unsigned int max_len,
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From aa408f835d025a839033988d3f5a2866314414ef Mon Sep 17 00:00:00 2001
+From: Daniel Rosenberg <drosen@google.com>
+Date: Mon, 20 Jan 2020 14:31:57 -0800
+Subject: fscrypt: derive dirhash key for casefolded directories
+
+When we allow indexed directories to use both encryption and
+casefolding, for the dirhash we can't just hash the ciphertext filenames
+that are stored on-disk (as is done currently) because the dirhash must
+be case insensitive, but the stored names are case-preserving.  Nor can
+we hash the plaintext names with an unkeyed hash (or a hash keyed with a
+value stored on-disk like ext4's s_hash_seed), since that would leak
+information about the names that encryption is meant to protect.
+
+Instead, if we can accept a dirhash that's only computable when the
+fscrypt key is available, we can hash the plaintext names with a keyed
+hash using a secret key derived from the directory's fscrypt master key.
+We'll use SipHash-2-4 for this purpose.
+
+Prepare for this by deriving a SipHash key for each casefolded encrypted
+directory.  Make sure to handle deriving the key not only when setting
+up the directory's fscrypt_info, but also in the case where the casefold
+flag is enabled after the fscrypt_info was already set up.  (We could
+just always derive the key regardless of casefolding, but that would
+introduce unnecessary overhead for people not using casefolding.)
+
+Signed-off-by: Daniel Rosenberg <drosen@google.com>
+[EB: improved commit message, updated fscrypt.rst, squashed with change
+ that avoids unnecessarily deriving the key, and many other cleanups]
+Link: https://lore.kernel.org/r/20200120223201.241390-3-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ Documentation/filesystems/fscrypt.rst | 10 +++++++
+ fs/crypto/fname.c                     | 21 ++++++++++++++
+ fs/crypto/fscrypt_private.h           | 13 +++++++++
+ fs/crypto/hooks.c                     | 16 +++++++++++
+ fs/crypto/keysetup.c                  | 54 ++++++++++++++++++++++++++---------
+ include/linux/fscrypt.h               | 10 +++++++
+ 6 files changed, 110 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/filesystems/fscrypt.rst b/Documentation/filesystems/fscrypt.rst
+index 380a1be9550e..c45f5bcc13e1 100644
+--- a/Documentation/filesystems/fscrypt.rst
++++ b/Documentation/filesystems/fscrypt.rst
+@@ -302,6 +302,16 @@ For master keys used for v2 encryption policies, a unique 16-byte "key
+ identifier" is also derived using the KDF.  This value is stored in
+ the clear, since it is needed to reliably identify the key itself.
+ 
++Dirhash keys
++------------
++
++For directories that are indexed using a secret-keyed dirhash over the
++plaintext filenames, the KDF is also used to derive a 128-bit
++SipHash-2-4 key per directory in order to hash filenames.  This works
++just like deriving a per-file encryption key, except that a different
++KDF context is used.  Currently, only casefolded ("case-insensitive")
++encrypted directories use this style of hashing.
++
+ Encryption modes and usage
+ ==========================
+ 
+diff --git a/fs/crypto/fname.c b/fs/crypto/fname.c
+index 4614e4969736..851d2082ecfe 100644
+--- a/fs/crypto/fname.c
++++ b/fs/crypto/fname.c
+@@ -402,6 +402,27 @@ errout:
+ }
+ EXPORT_SYMBOL(fscrypt_setup_filename);
+ 
++/**
++ * fscrypt_fname_siphash() - calculate the SipHash of a filename
++ * @dir: the parent directory
++ * @name: the filename to calculate the SipHash of
++ *
++ * Given a plaintext filename @name and a directory @dir which uses SipHash as
++ * its dirhash method and has had its fscrypt key set up, this function
++ * calculates the SipHash of that name using the directory's secret dirhash key.
++ *
++ * Return: the SipHash of @name using the hash key of @dir
++ */
++u64 fscrypt_fname_siphash(const struct inode *dir, const struct qstr *name)
++{
++	const struct fscrypt_info *ci = dir->i_crypt_info;
++
++	WARN_ON(!ci->ci_dirhash_key_initialized);
++
++	return siphash(name->name, name->len, &ci->ci_dirhash_key);
++}
++EXPORT_SYMBOL_GPL(fscrypt_fname_siphash);
++
+ /*
+  * Validate dentries in encrypted directories to make sure we aren't potentially
+  * caching stale dentries after a key has been added.
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index fea7f5547428..81dbb2befe81 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -12,6 +12,7 @@
+ #define _FSCRYPT_PRIVATE_H
+ 
+ #include <linux/fscrypt.h>
++#include <linux/siphash.h>
+ #include <crypto/hash.h>
+ 
+ #define CONST_STRLEN(str)	(sizeof(str) - 1)
+@@ -188,6 +189,14 @@ struct fscrypt_info {
+ 	 */
+ 	struct fscrypt_direct_key *ci_direct_key;
+ 
++	/*
++	 * This inode's hash key for filenames.  This is a 128-bit SipHash-2-4
++	 * key.  This is only set for directories that use a keyed dirhash over
++	 * the plaintext filenames -- currently just casefolded directories.
++	 */
++	siphash_key_t ci_dirhash_key;
++	bool ci_dirhash_key_initialized;
++
+ 	/* The encryption policy used by this inode */
+ 	union fscrypt_policy ci_policy;
+ 
+@@ -263,6 +272,7 @@ extern int fscrypt_init_hkdf(struct fscrypt_hkdf *hkdf, const u8 *master_key,
+ #define HKDF_CONTEXT_PER_FILE_KEY	2
+ #define HKDF_CONTEXT_DIRECT_KEY		3
+ #define HKDF_CONTEXT_IV_INO_LBLK_64_KEY	4
++#define HKDF_CONTEXT_DIRHASH_KEY	5
+ 
+ extern int fscrypt_hkdf_expand(const struct fscrypt_hkdf *hkdf, u8 context,
+ 			       const u8 *info, unsigned int infolen,
+@@ -434,6 +444,9 @@ fscrypt_allocate_skcipher(struct fscrypt_mode *mode, const u8 *raw_key,
+ extern int fscrypt_set_derived_key(struct fscrypt_info *ci,
+ 				   const u8 *derived_key);
+ 
++extern int fscrypt_derive_dirhash_key(struct fscrypt_info *ci,
++				      const struct fscrypt_master_key *mk);
++
+ /* keysetup_v1.c */
+ 
+ extern void fscrypt_put_direct_key(struct fscrypt_direct_key *dk);
+diff --git a/fs/crypto/hooks.c b/fs/crypto/hooks.c
+index fd4e5ae21077..5ef861742921 100644
+--- a/fs/crypto/hooks.c
++++ b/fs/crypto/hooks.c
+@@ -5,6 +5,8 @@
+  * Encryption hooks for higher-level filesystem operations.
+  */
+ 
++#include <linux/key.h>
++
+ #include "fscrypt_private.h"
+ 
+ /**
+@@ -137,8 +139,14 @@ int fscrypt_prepare_setflags(struct inode *inode,
+ 			     unsigned int oldflags, unsigned int flags)
+ {
+ 	struct fscrypt_info *ci;
++	struct fscrypt_master_key *mk;
+ 	int err;
+ 
++	/*
++	 * When the CASEFOLD flag is set on an encrypted directory, we must
++	 * derive the secret key needed for the dirhash.  This is only possible
++	 * if the directory uses a v2 encryption policy.
++	 */
+ 	if (IS_ENCRYPTED(inode) && (flags & ~oldflags & FS_CASEFOLD_FL)) {
+ 		err = fscrypt_require_key(inode);
+ 		if (err)
+@@ -146,6 +154,14 @@ int fscrypt_prepare_setflags(struct inode *inode,
+ 		ci = inode->i_crypt_info;
+ 		if (ci->ci_policy.version != FSCRYPT_POLICY_V2)
+ 			return -EINVAL;
++		mk = ci->ci_master_key->payload.data[0];
++		down_read(&mk->mk_secret_sem);
++		if (is_master_key_secret_present(&mk->mk_secret))
++			err = fscrypt_derive_dirhash_key(ci, mk);
++		else
++			err = -ENOKEY;
++		up_read(&mk->mk_secret_sem);
++		return err;
+ 	}
+ 	return 0;
+ }
+diff --git a/fs/crypto/keysetup.c b/fs/crypto/keysetup.c
+index 96074054bdbc..74d61d827d91 100644
+--- a/fs/crypto/keysetup.c
++++ b/fs/crypto/keysetup.c
+@@ -174,10 +174,24 @@ done:
+ 	return 0;
+ }
+ 
++int fscrypt_derive_dirhash_key(struct fscrypt_info *ci,
++			       const struct fscrypt_master_key *mk)
++{
++	int err;
++
++	err = fscrypt_hkdf_expand(&mk->mk_secret.hkdf, HKDF_CONTEXT_DIRHASH_KEY,
++				  ci->ci_nonce, FS_KEY_DERIVATION_NONCE_SIZE,
++				  (u8 *)&ci->ci_dirhash_key,
++				  sizeof(ci->ci_dirhash_key));
++	if (err)
++		return err;
++	ci->ci_dirhash_key_initialized = true;
++	return 0;
++}
++
+ static int fscrypt_setup_v2_file_key(struct fscrypt_info *ci,
+ 				     struct fscrypt_master_key *mk)
+ {
+-	u8 derived_key[FSCRYPT_MAX_KEY_SIZE];
+ 	int err;
+ 
+ 	if (ci->ci_policy.v2.flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) {
+@@ -189,8 +203,8 @@ static int fscrypt_setup_v2_file_key(struct fscrypt_info *ci,
+ 		 * This ensures that the master key is consistently used only
+ 		 * for HKDF, avoiding key reuse issues.
+ 		 */
+-		return setup_per_mode_key(ci, mk, mk->mk_direct_tfms,
+-					  HKDF_CONTEXT_DIRECT_KEY, false);
++		err = setup_per_mode_key(ci, mk, mk->mk_direct_tfms,
++					 HKDF_CONTEXT_DIRECT_KEY, false);
+ 	} else if (ci->ci_policy.v2.flags &
+ 		   FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) {
+ 		/*
+@@ -199,21 +213,33 @@ static int fscrypt_setup_v2_file_key(struct fscrypt_info *ci,
+ 		 * the IVs.  This format is optimized for use with inline
+ 		 * encryption hardware compliant with the UFS or eMMC standards.
+ 		 */
+-		return setup_per_mode_key(ci, mk, mk->mk_iv_ino_lblk_64_tfms,
+-					  HKDF_CONTEXT_IV_INO_LBLK_64_KEY,
+-					  true);
++		err = setup_per_mode_key(ci, mk, mk->mk_iv_ino_lblk_64_tfms,
++					 HKDF_CONTEXT_IV_INO_LBLK_64_KEY, true);
++	} else {
++		u8 derived_key[FSCRYPT_MAX_KEY_SIZE];
++
++		err = fscrypt_hkdf_expand(&mk->mk_secret.hkdf,
++					  HKDF_CONTEXT_PER_FILE_KEY,
++					  ci->ci_nonce,
++					  FS_KEY_DERIVATION_NONCE_SIZE,
++					  derived_key, ci->ci_mode->keysize);
++		if (err)
++			return err;
++
++		err = fscrypt_set_derived_key(ci, derived_key);
++		memzero_explicit(derived_key, ci->ci_mode->keysize);
+ 	}
+-
+-	err = fscrypt_hkdf_expand(&mk->mk_secret.hkdf,
+-				  HKDF_CONTEXT_PER_FILE_KEY,
+-				  ci->ci_nonce, FS_KEY_DERIVATION_NONCE_SIZE,
+-				  derived_key, ci->ci_mode->keysize);
+ 	if (err)
+ 		return err;
+ 
+-	err = fscrypt_set_derived_key(ci, derived_key);
+-	memzero_explicit(derived_key, ci->ci_mode->keysize);
+-	return err;
++	/* Derive a secret dirhash key for directories that need it. */
++	if (S_ISDIR(ci->ci_inode->i_mode) && IS_CASEFOLDED(ci->ci_inode)) {
++		err = fscrypt_derive_dirhash_key(ci, mk);
++		if (err)
++			return err;
++	}
++
++	return 0;
+ }
+ 
+ /*
+diff --git a/include/linux/fscrypt.h b/include/linux/fscrypt.h
+index 3984eadd7023..34bc5f73200c 100644
+--- a/include/linux/fscrypt.h
++++ b/include/linux/fscrypt.h
+@@ -247,6 +247,9 @@ static inline bool fscrypt_match_name(const struct fscrypt_name *fname,
+ 	return !memcmp(de_name, fname->disk_name.name, fname->disk_name.len);
+ }
+ 
++extern u64 fscrypt_fname_siphash(const struct inode *dir,
++				 const struct qstr *name);
++
+ /* bio.c */
+ extern void fscrypt_decrypt_bio(struct bio *);
+ extern int fscrypt_zeroout_range(const struct inode *, pgoff_t, sector_t,
+@@ -479,6 +482,13 @@ static inline bool fscrypt_match_name(const struct fscrypt_name *fname,
+ 	return !memcmp(de_name, fname->disk_name.name, fname->disk_name.len);
+ }
+ 
++static inline u64 fscrypt_fname_siphash(const struct inode *dir,
++					const struct qstr *name)
++{
++	WARN_ON_ONCE(1);
++	return 0;
++}
++
+ /* bio.c */
+ static inline void fscrypt_decrypt_bio(struct bio *bio)
+ {
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From f592efe735a29c764e0d473307dab0f59665f02b Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 20 Jan 2020 14:31:58 -0800
+Subject: fscrypt: clarify what is meant by a per-file key
+
+Now that there's sometimes a second type of per-file key (the dirhash
+key), clarify some function names, macros, and documentation that
+specifically deal with per-file *encryption* keys.
+
+Link: https://lore.kernel.org/r/20200120223201.241390-4-ebiggers@kernel.org
+Reviewed-by: Daniel Rosenberg <drosen@google.com>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ Documentation/filesystems/fscrypt.rst | 24 ++++++++++-----------
+ fs/crypto/fscrypt_private.h           |  6 +++---
+ fs/crypto/keysetup.c                  | 39 ++++++++++++++++++-----------------
+ fs/crypto/keysetup_v1.c               |  4 ++--
+ 4 files changed, 37 insertions(+), 36 deletions(-)
+
+diff --git a/Documentation/filesystems/fscrypt.rst b/Documentation/filesystems/fscrypt.rst
+index c45f5bcc13e1..d5b1b49c3d00 100644
+--- a/Documentation/filesystems/fscrypt.rst
++++ b/Documentation/filesystems/fscrypt.rst
+@@ -234,8 +234,8 @@ HKDF is more flexible, is nonreversible, and evenly distributes
+ entropy from the master key.  HKDF is also standardized and widely
+ used by other software, whereas the AES-128-ECB based KDF is ad-hoc.
+ 
+-Per-file keys
+--------------
++Per-file encryption keys
++------------------------
+ 
+ Since each master key can protect many files, it is necessary to
+ "tweak" the encryption of each file so that the same plaintext in two
+@@ -268,9 +268,9 @@ is greater than that of an AES-256-XTS key.
+ Therefore, to improve performance and save memory, for Adiantum a
+ "direct key" configuration is supported.  When the user has enabled
+ this by setting FSCRYPT_POLICY_FLAG_DIRECT_KEY in the fscrypt policy,
+-per-file keys are not used.  Instead, whenever any data (contents or
+-filenames) is encrypted, the file's 16-byte nonce is included in the
+-IV.  Moreover:
++per-file encryption keys are not used.  Instead, whenever any data
++(contents or filenames) is encrypted, the file's 16-byte nonce is
++included in the IV.  Moreover:
+ 
+ - For v1 encryption policies, the encryption is done directly with the
+   master key.  Because of this, users **must not** use the same master
+@@ -335,11 +335,11 @@ used.
+ Adiantum is a (primarily) stream cipher-based mode that is fast even
+ on CPUs without dedicated crypto instructions.  It's also a true
+ wide-block mode, unlike XTS.  It can also eliminate the need to derive
+-per-file keys.  However, it depends on the security of two primitives,
+-XChaCha12 and AES-256, rather than just one.  See the paper
+-"Adiantum: length-preserving encryption for entry-level processors"
+-(https://eprint.iacr.org/2018/720.pdf) for more details.  To use
+-Adiantum, CONFIG_CRYPTO_ADIANTUM must be enabled.  Also, fast
++per-file encryption keys.  However, it depends on the security of two
++primitives, XChaCha12 and AES-256, rather than just one.  See the
++paper "Adiantum: length-preserving encryption for entry-level
++processors" (https://eprint.iacr.org/2018/720.pdf) for more details.
++To use Adiantum, CONFIG_CRYPTO_ADIANTUM must be enabled.  Also, fast
+ implementations of ChaCha and NHPoly1305 should be enabled, e.g.
+ CONFIG_CRYPTO_CHACHA20_NEON and CONFIG_CRYPTO_NHPOLY1305_NEON for ARM.
+ 
+@@ -1149,8 +1149,8 @@ The context structs contain the same information as the corresponding
+ policy structs (see `Setting an encryption policy`_), except that the
+ context structs also contain a nonce.  The nonce is randomly generated
+ by the kernel and is used as KDF input or as a tweak to cause
+-different files to be encrypted differently; see `Per-file keys`_ and
+-`DIRECT_KEY policies`_.
++different files to be encrypted differently; see `Per-file encryption
++keys`_ and `DIRECT_KEY policies`_.
+ 
+ Data path changes
+ -----------------
+diff --git a/fs/crypto/fscrypt_private.h b/fs/crypto/fscrypt_private.h
+index 81dbb2befe81..9aae851409e5 100644
+--- a/fs/crypto/fscrypt_private.h
++++ b/fs/crypto/fscrypt_private.h
+@@ -269,7 +269,7 @@ extern int fscrypt_init_hkdf(struct fscrypt_hkdf *hkdf, const u8 *master_key,
+  * output doesn't reveal another.
+  */
+ #define HKDF_CONTEXT_KEY_IDENTIFIER	1
+-#define HKDF_CONTEXT_PER_FILE_KEY	2
++#define HKDF_CONTEXT_PER_FILE_ENC_KEY	2
+ #define HKDF_CONTEXT_DIRECT_KEY		3
+ #define HKDF_CONTEXT_IV_INO_LBLK_64_KEY	4
+ #define HKDF_CONTEXT_DIRHASH_KEY	5
+@@ -441,8 +441,8 @@ extern struct crypto_skcipher *
+ fscrypt_allocate_skcipher(struct fscrypt_mode *mode, const u8 *raw_key,
+ 			  const struct inode *inode);
+ 
+-extern int fscrypt_set_derived_key(struct fscrypt_info *ci,
+-				   const u8 *derived_key);
++extern int fscrypt_set_per_file_enc_key(struct fscrypt_info *ci,
++					const u8 *raw_key);
+ 
+ extern int fscrypt_derive_dirhash_key(struct fscrypt_info *ci,
+ 				      const struct fscrypt_master_key *mk);
+diff --git a/fs/crypto/keysetup.c b/fs/crypto/keysetup.c
+index 74d61d827d91..65cb09fa6ead 100644
+--- a/fs/crypto/keysetup.c
++++ b/fs/crypto/keysetup.c
+@@ -107,12 +107,12 @@ err_free_tfm:
+ 	return ERR_PTR(err);
+ }
+ 
+-/* Given the per-file key, set up the file's crypto transform object */
+-int fscrypt_set_derived_key(struct fscrypt_info *ci, const u8 *derived_key)
++/* Given a per-file encryption key, set up the file's crypto transform object */
++int fscrypt_set_per_file_enc_key(struct fscrypt_info *ci, const u8 *raw_key)
+ {
+ 	struct crypto_skcipher *tfm;
+ 
+-	tfm = fscrypt_allocate_skcipher(ci->ci_mode, derived_key, ci->ci_inode);
++	tfm = fscrypt_allocate_skcipher(ci->ci_mode, raw_key, ci->ci_inode);
+ 	if (IS_ERR(tfm))
+ 		return PTR_ERR(tfm);
+ 
+@@ -121,10 +121,10 @@ int fscrypt_set_derived_key(struct fscrypt_info *ci, const u8 *derived_key)
+ 	return 0;
+ }
+ 
+-static int setup_per_mode_key(struct fscrypt_info *ci,
+-			      struct fscrypt_master_key *mk,
+-			      struct crypto_skcipher **tfms,
+-			      u8 hkdf_context, bool include_fs_uuid)
++static int setup_per_mode_enc_key(struct fscrypt_info *ci,
++				  struct fscrypt_master_key *mk,
++				  struct crypto_skcipher **tfms,
++				  u8 hkdf_context, bool include_fs_uuid)
+ {
+ 	const struct inode *inode = ci->ci_inode;
+ 	const struct super_block *sb = inode->i_sb;
+@@ -196,15 +196,15 @@ static int fscrypt_setup_v2_file_key(struct fscrypt_info *ci,
+ 
+ 	if (ci->ci_policy.v2.flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) {
+ 		/*
+-		 * DIRECT_KEY: instead of deriving per-file keys, the per-file
+-		 * nonce will be included in all the IVs.  But unlike v1
+-		 * policies, for v2 policies in this case we don't encrypt with
+-		 * the master key directly but rather derive a per-mode key.
+-		 * This ensures that the master key is consistently used only
+-		 * for HKDF, avoiding key reuse issues.
++		 * DIRECT_KEY: instead of deriving per-file encryption keys, the
++		 * per-file nonce will be included in all the IVs.  But unlike
++		 * v1 policies, for v2 policies in this case we don't encrypt
++		 * with the master key directly but rather derive a per-mode
++		 * encryption key.  This ensures that the master key is
++		 * consistently used only for HKDF, avoiding key reuse issues.
+ 		 */
+-		err = setup_per_mode_key(ci, mk, mk->mk_direct_tfms,
+-					 HKDF_CONTEXT_DIRECT_KEY, false);
++		err = setup_per_mode_enc_key(ci, mk, mk->mk_direct_tfms,
++					     HKDF_CONTEXT_DIRECT_KEY, false);
+ 	} else if (ci->ci_policy.v2.flags &
+ 		   FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) {
+ 		/*
+@@ -213,20 +213,21 @@ static int fscrypt_setup_v2_file_key(struct fscrypt_info *ci,
+ 		 * the IVs.  This format is optimized for use with inline
+ 		 * encryption hardware compliant with the UFS or eMMC standards.
+ 		 */
+-		err = setup_per_mode_key(ci, mk, mk->mk_iv_ino_lblk_64_tfms,
+-					 HKDF_CONTEXT_IV_INO_LBLK_64_KEY, true);
++		err = setup_per_mode_enc_key(ci, mk, mk->mk_iv_ino_lblk_64_tfms,
++					     HKDF_CONTEXT_IV_INO_LBLK_64_KEY,
++					     true);
+ 	} else {
+ 		u8 derived_key[FSCRYPT_MAX_KEY_SIZE];
+ 
+ 		err = fscrypt_hkdf_expand(&mk->mk_secret.hkdf,
+-					  HKDF_CONTEXT_PER_FILE_KEY,
++					  HKDF_CONTEXT_PER_FILE_ENC_KEY,
+ 					  ci->ci_nonce,
+ 					  FS_KEY_DERIVATION_NONCE_SIZE,
+ 					  derived_key, ci->ci_mode->keysize);
+ 		if (err)
+ 			return err;
+ 
+-		err = fscrypt_set_derived_key(ci, derived_key);
++		err = fscrypt_set_per_file_enc_key(ci, derived_key);
+ 		memzero_explicit(derived_key, ci->ci_mode->keysize);
+ 	}
+ 	if (err)
+diff --git a/fs/crypto/keysetup_v1.c b/fs/crypto/keysetup_v1.c
+index 3578c1c607c5..801b48c0cd7f 100644
+--- a/fs/crypto/keysetup_v1.c
++++ b/fs/crypto/keysetup_v1.c
+@@ -9,7 +9,7 @@
+  * This file implements compatibility functions for the original encryption
+  * policy version ("v1"), including:
+  *
+- * - Deriving per-file keys using the AES-128-ECB based KDF
++ * - Deriving per-file encryption keys using the AES-128-ECB based KDF
+  *   (rather than the new method of using HKDF-SHA512)
+  *
+  * - Retrieving fscrypt master keys from process-subscribed keyrings
+@@ -283,7 +283,7 @@ static int setup_v1_file_key_derived(struct fscrypt_info *ci,
+ 	if (err)
+ 		goto out;
+ 
+-	err = fscrypt_set_derived_key(ci, derived_key);
++	err = fscrypt_set_per_file_enc_key(ci, derived_key);
+ out:
+ 	kzfree(derived_key);
+ 	return err;
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From f0d07a98a070bb5e443df19c3aa55693cbca9341 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 20 Jan 2020 14:31:59 -0800
+Subject: ubifs: don't trigger assertion on invalid no-key filename
+
+If userspace provides an invalid fscrypt no-key filename which encodes a
+hash value with any of the UBIFS node type bits set (i.e. the high 3
+bits), gracefully report ENOENT rather than triggering ubifs_assert().
+
+Test case with kvm-xfstests shell:
+
+    . fs/ubifs/config
+    . ~/xfstests/common/encrypt
+    dev=$(__blkdev_to_ubi_volume /dev/vdc)
+    ubiupdatevol $dev -t
+    mount $dev /mnt -t ubifs
+    mkdir /mnt/edir
+    xfs_io -c set_encpolicy /mnt/edir
+    rm /mnt/edir/_,,,,,DAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+With the bug, the following assertion fails on the 'rm' command:
+
+    [   19.066048] UBIFS error (ubi0:0 pid 379): ubifs_assert_failed: UBIFS assert failed: !(hash & ~UBIFS_S_KEY_HASH_MASK), in fs/ubifs/key.h:170
+
+Fixes: f4f61d2cc6d8 ("ubifs: Implement encrypted filenames")
+Cc: <stable@vger.kernel.org> # v4.10+
+Link: https://lore.kernel.org/r/20200120223201.241390-5-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/ubifs/dir.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/ubifs/dir.c b/fs/ubifs/dir.c
+index 636c3222c230..5f937226976a 100644
+--- a/fs/ubifs/dir.c
++++ b/fs/ubifs/dir.c
+@@ -228,6 +228,8 @@ static struct dentry *ubifs_lookup(struct inode *dir, struct dentry *dentry,
+ 	if (nm.hash) {
+ 		ubifs_assert(c, fname_len(&nm) == 0);
+ 		ubifs_assert(c, fname_name(&nm) == NULL);
++		if (nm.hash & ~UBIFS_S_KEY_HASH_MASK)
++			goto done; /* ENOENT */
+ 		dent_key_init_hash(c, &key, dir->i_ino, nm.hash);
+ 		err = ubifs_tnc_lookup_dh(c, &key, dent, nm.minor_hash);
+ 	} else {
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From aec992aab890b2dece2c5c95dbd6953aeecd45cb Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 20 Jan 2020 14:32:00 -0800
+Subject: ubifs: allow both hash and disk name to be provided in no-key names
+
+In order to support a new dirhash method that is a secret-keyed hash
+over the plaintext filenames (which will be used by encrypted+casefolded
+directories on ext4 and f2fs), fscrypt will be switching to a new no-key
+name format that always encodes the dirhash in the name.
+
+UBIFS isn't happy with this because it has assertions that verify that
+either the hash or the disk name is provided, not both.
+
+Change it to use the disk name if one is provided, even if a hash is
+available too; else use the hash.
+
+Link: https://lore.kernel.org/r/20200120223201.241390-6-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ fs/ubifs/dir.c     | 4 +---
+ fs/ubifs/journal.c | 4 ++--
+ fs/ubifs/key.h     | 1 -
+ 3 files changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/fs/ubifs/dir.c b/fs/ubifs/dir.c
+index 5f937226976a..ef85ec167a84 100644
+--- a/fs/ubifs/dir.c
++++ b/fs/ubifs/dir.c
+@@ -225,9 +225,7 @@ static struct dentry *ubifs_lookup(struct inode *dir, struct dentry *dentry,
+ 		goto done;
+ 	}
+ 
+-	if (nm.hash) {
+-		ubifs_assert(c, fname_len(&nm) == 0);
+-		ubifs_assert(c, fname_name(&nm) == NULL);
++	if (fname_name(&nm) == NULL) {
+ 		if (nm.hash & ~UBIFS_S_KEY_HASH_MASK)
+ 			goto done; /* ENOENT */
+ 		dent_key_init_hash(c, &key, dir->i_ino, nm.hash);
+diff --git a/fs/ubifs/journal.c b/fs/ubifs/journal.c
+index a38e18d3ef1d..3bf8b1fda9d7 100644
+--- a/fs/ubifs/journal.c
++++ b/fs/ubifs/journal.c
+@@ -588,7 +588,7 @@ int ubifs_jnl_update(struct ubifs_info *c, const struct inode *dir,
+ 
+ 	if (!xent) {
+ 		dent->ch.node_type = UBIFS_DENT_NODE;
+-		if (nm->hash)
++		if (fname_name(nm) == NULL)
+ 			dent_key_init_hash(c, &dent_key, dir->i_ino, nm->hash);
+ 		else
+ 			dent_key_init(c, &dent_key, dir->i_ino, nm);
+@@ -646,7 +646,7 @@ int ubifs_jnl_update(struct ubifs_info *c, const struct inode *dir,
+ 	ubifs_add_auth_dirt(c, lnum);
+ 
+ 	if (deletion) {
+-		if (nm->hash)
++		if (fname_name(nm) == NULL)
+ 			err = ubifs_tnc_remove_dh(c, &dent_key, nm->minor_hash);
+ 		else
+ 			err = ubifs_tnc_remove_nm(c, &dent_key, nm);
+diff --git a/fs/ubifs/key.h b/fs/ubifs/key.h
+index afa704ff5ca0..8142d9d6fe5d 100644
+--- a/fs/ubifs/key.h
++++ b/fs/ubifs/key.h
+@@ -150,7 +150,6 @@ static inline void dent_key_init(const struct ubifs_info *c,
+ 	uint32_t hash = c->key_hash(fname_name(nm), fname_len(nm));
+ 
+ 	ubifs_assert(c, !(hash & ~UBIFS_S_KEY_HASH_MASK));
+-	ubifs_assert(c, !nm->hash && !nm->minor_hash);
+ 	key->u32[0] = inum;
+ 	key->u32[1] = hash | (UBIFS_DENT_KEY << UBIFS_S_KEY_HASH_BITS);
+ }
+-- 
+cgit 1.2-0.3.lf.el7
+
+
+From edc440e3d27fb31e6f9663cf413fad97d714c060 Mon Sep 17 00:00:00 2001
+From: Daniel Rosenberg <drosen@google.com>
+Date: Mon, 20 Jan 2020 14:32:01 -0800
+Subject: fscrypt: improve format of no-key names
+
+When an encrypted directory is listed without the key, the filesystem
+must show "no-key names" that uniquely identify directory entries, are
+at most 255 (NAME_MAX) bytes long, and don't contain '/' or '\0'.
+Currently, for short names the no-key name is the base64 encoding of the
+ciphertext filename, while for long names it's the base64 encoding of
+the ciphertext filename's dirhash and second-to-last 16-byte block.
+
+This format has the following problems:
+
+- Since it doesn't always include the dirhash, it's incompatible with
+  directories that will use a secret-keyed dirhash over the plaintext
+  filenames.  In this case, the dirhash won't be computable from the
+  ciphertext name without the key, so it instead must be retrieved from
+  the directory entry and always included in the no-key name.
+  Casefolded encrypted directories will use this type of dirhash.
+
+- It's ambiguous: it's possible to craft two filenames that map to the
+  same no-key name, since the method used to abbreviate long filenames
+  doesn't use a proper cryptographic hash function.
+
+Solve both these problems by switching to a new no-key name format that
+is the base64 encoding of a variable-length structure that contains the
+dirhash, up to 149 bytes of the ciphertext filename, and (if any bytes
+remain) the SHA-256 of the remaining bytes of the ciphertext filename.
+
+This ensures that each no-key name contains everything needed to find
+the directory entry again, contains only legal characters, doesn't
+exceed NAME_MAX, is unambiguous unless there's a SHA-256 collision, and
+that we only take the performance hit of SHA-256 on very long filenames.
+
+Note: this change does *not* address the existing issue where users can
+modify the 'dirhash' part of a no-key name and the filesystem may still
+accept the name.
+
+Signed-off-by: Daniel Rosenberg <drosen@google.com>
+[EB: improved comments and commit message, fixed checking return value
+ of base64_decode(), check for SHA-256 error, continue to set disk_name
+ for short names to keep matching simpler, and many other cleanups]
+Link: https://lore.kernel.org/r/20200120223201.241390-7-ebiggers@kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ Documentation/filesystems/fscrypt.rst |   2 +-
+ fs/crypto/Kconfig                     |   1 +
+ fs/crypto/fname.c                     | 218 ++++++++++++++++++++++++++--------
+ include/linux/fscrypt.h               |  77 +-----------
+ 4 files changed, 171 insertions(+), 127 deletions(-)
+
+diff --git a/Documentation/filesystems/fscrypt.rst b/Documentation/filesystems/fscrypt.rst
+index d5b1b49c3d00..01e909245fcd 100644
+--- a/Documentation/filesystems/fscrypt.rst
++++ b/Documentation/filesystems/fscrypt.rst
+@@ -1202,7 +1202,7 @@ filesystem-specific hash(es) needed for directory lookups.  This
+ allows the filesystem to still, with a high degree of confidence, map
+ the filename given in ->lookup() back to a particular directory entry
+ that was previously listed by readdir().  See :c:type:`struct
+-fscrypt_digested_name` in the source for more details.
++fscrypt_nokey_name` in the source for more details.
+ 
+ Note that the precise way that filenames are presented to userspace
+ without the key is subject to change in the future.  It is only meant
+diff --git a/fs/crypto/Kconfig b/fs/crypto/Kconfig
+index 02df95b44331..8046d7c7a3e9 100644
+--- a/fs/crypto/Kconfig
++++ b/fs/crypto/Kconfig
+@@ -21,5 +21,6 @@ config FS_ENCRYPTION_ALGS
+ 	select CRYPTO_CTS
+ 	select CRYPTO_ECB
+ 	select CRYPTO_HMAC
++	select CRYPTO_SHA256
+ 	select CRYPTO_SHA512
+ 	select CRYPTO_XTS
+diff --git a/fs/crypto/fname.c b/fs/crypto/fname.c
+index 851d2082ecfe..4c212442a8f7 100644
+--- a/fs/crypto/fname.c
++++ b/fs/crypto/fname.c
+@@ -13,9 +13,85 @@
+ 
+ #include <linux/namei.h>
+ #include <linux/scatterlist.h>
++#include <crypto/hash.h>
++#include <crypto/sha.h>
+ #include <crypto/skcipher.h>
+ #include "fscrypt_private.h"
+ 
++/**
++ * struct fscrypt_nokey_name - identifier for directory entry when key is absent
++ *
++ * When userspace lists an encrypted directory without access to the key, the
++ * filesystem must present a unique "no-key name" for each filename that allows
++ * it to find the directory entry again if requested.  Naively, that would just
++ * mean using the ciphertext filenames.  However, since the ciphertext filenames
++ * can contain illegal characters ('\0' and '/'), they must be encoded in some
++ * way.  We use base64.  But that can cause names to exceed NAME_MAX (255
++ * bytes), so we also need to use a strong hash to abbreviate long names.
++ *
++ * The filesystem may also need another kind of hash, the "dirhash", to quickly
++ * find the directory entry.  Since filesystems normally compute the dirhash
++ * over the on-disk filename (i.e. the ciphertext), it's not computable from
++ * no-key names that abbreviate the ciphertext using the strong hash to fit in
++ * NAME_MAX.  It's also not computable if it's a keyed hash taken over the
++ * plaintext (but it may still be available in the on-disk directory entry);
++ * casefolded directories use this type of dirhash.  At least in these cases,
++ * each no-key name must include the name's dirhash too.
++ *
++ * To meet all these requirements, we base64-encode the following
++ * variable-length structure.  It contains the dirhash, or 0's if the filesystem
++ * didn't provide one; up to 149 bytes of the ciphertext name; and for
++ * ciphertexts longer than 149 bytes, also the SHA-256 of the remaining bytes.
++ *
++ * This ensures that each no-key name contains everything needed to find the
++ * directory entry again, contains only legal characters, doesn't exceed
++ * NAME_MAX, is unambiguous unless there's a SHA-256 collision, and that we only
++ * take the performance hit of SHA-256 on very long filenames (which are rare).
++ */
++struct fscrypt_nokey_name {
++	u32 dirhash[2];
++	u8 bytes[149];
++	u8 sha256[SHA256_DIGEST_SIZE];
++}; /* 189 bytes => 252 bytes base64-encoded, which is <= NAME_MAX (255) */
++
++/*
++ * Decoded size of max-size nokey name, i.e. a name that was abbreviated using
++ * the strong hash and thus includes the 'sha256' field.  This isn't simply
++ * sizeof(struct fscrypt_nokey_name), as the padding at the end isn't included.
++ */
++#define FSCRYPT_NOKEY_NAME_MAX	offsetofend(struct fscrypt_nokey_name, sha256)
++
++static struct crypto_shash *sha256_hash_tfm;
++
++static int fscrypt_do_sha256(const u8 *data, unsigned int data_len, u8 *result)
++{
++	struct crypto_shash *tfm = READ_ONCE(sha256_hash_tfm);
++
++	if (unlikely(!tfm)) {
++		struct crypto_shash *prev_tfm;
++
++		tfm = crypto_alloc_shash("sha256", 0, 0);
++		if (IS_ERR(tfm)) {
++			fscrypt_err(NULL,
++				    "Error allocating SHA-256 transform: %ld",
++				    PTR_ERR(tfm));
++			return PTR_ERR(tfm);
++		}
++		prev_tfm = cmpxchg(&sha256_hash_tfm, NULL, tfm);
++		if (prev_tfm) {
++			crypto_free_shash(tfm);
++			tfm = prev_tfm;
++		}
++	}
++	{
++		SHASH_DESC_ON_STACK(desc, tfm);
++
++		desc->tfm = tfm;
++
++		return crypto_shash_digest(desc, data, data_len, result);
++	}
++}
++
+ static inline bool fscrypt_is_dot_dotdot(const struct qstr *str)
+ {
+ 	if (str->len == 1 && str->name[0] == '.')
+@@ -207,9 +283,7 @@ int fscrypt_fname_alloc_buffer(const struct inode *inode,
+ 			       u32 max_encrypted_len,
+ 			       struct fscrypt_str *crypto_str)
+ {
+-	const u32 max_encoded_len =
+-		max_t(u32, BASE64_CHARS(FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE),
+-		      1 + BASE64_CHARS(sizeof(struct fscrypt_digested_name)));
++	const u32 max_encoded_len = BASE64_CHARS(FSCRYPT_NOKEY_NAME_MAX);
+ 	u32 max_presented_len;
+ 
+ 	max_presented_len = max(max_encoded_len, max_encrypted_len);
+@@ -242,9 +316,9 @@ EXPORT_SYMBOL(fscrypt_fname_free_buffer);
+  *
+  * The caller must have allocated sufficient memory for the @oname string.
+  *
+- * If the key is available, we'll decrypt the disk name; otherwise, we'll encode
+- * it for presentation.  Short names are directly base64-encoded, while long
+- * names are encoded in fscrypt_digested_name format.
++ * If the key is available, we'll decrypt the disk name.  Otherwise, we'll
++ * encode it for presentation in fscrypt_nokey_name format.
++ * See struct fscrypt_nokey_name for details.
+  *
+  * Return: 0 on success, -errno on failure
+  */
+@@ -254,7 +328,9 @@ int fscrypt_fname_disk_to_usr(const struct inode *inode,
+ 			      struct fscrypt_str *oname)
+ {
+ 	const struct qstr qname = FSTR_TO_QSTR(iname);
+-	struct fscrypt_digested_name digested_name;
++	struct fscrypt_nokey_name nokey_name;
++	u32 size; /* size of the unencoded no-key name */
++	int err;
+ 
+ 	if (fscrypt_is_dot_dotdot(&qname)) {
+ 		oname->name[0] = '.';
+@@ -269,24 +345,37 @@ int fscrypt_fname_disk_to_usr(const struct inode *inode,
+ 	if (fscrypt_has_encryption_key(inode))
+ 		return fname_decrypt(inode, iname, oname);
+ 
+-	if (iname->len <= FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE) {
+-		oname->len = base64_encode(iname->name, iname->len,
+-					   oname->name);
+-		return 0;
+-	}
++	/*
++	 * Sanity check that struct fscrypt_nokey_name doesn't have padding
++	 * between fields and that its encoded size never exceeds NAME_MAX.
++	 */
++	BUILD_BUG_ON(offsetofend(struct fscrypt_nokey_name, dirhash) !=
++		     offsetof(struct fscrypt_nokey_name, bytes));
++	BUILD_BUG_ON(offsetofend(struct fscrypt_nokey_name, bytes) !=
++		     offsetof(struct fscrypt_nokey_name, sha256));
++	BUILD_BUG_ON(BASE64_CHARS(FSCRYPT_NOKEY_NAME_MAX) > NAME_MAX);
++
+ 	if (hash) {
+-		digested_name.hash = hash;
+-		digested_name.minor_hash = minor_hash;
++		nokey_name.dirhash[0] = hash;
++		nokey_name.dirhash[1] = minor_hash;
++	} else {
++		nokey_name.dirhash[0] = 0;
++		nokey_name.dirhash[1] = 0;
++	}
++	if (iname->len <= sizeof(nokey_name.bytes)) {
++		memcpy(nokey_name.bytes, iname->name, iname->len);
++		size = offsetof(struct fscrypt_nokey_name, bytes[iname->len]);
+ 	} else {
+-		digested_name.hash = 0;
+-		digested_name.minor_hash = 0;
++		memcpy(nokey_name.bytes, iname->name, sizeof(nokey_name.bytes));
++		/* Compute strong hash of remaining part of name. */
++		err = fscrypt_do_sha256(&iname->name[sizeof(nokey_name.bytes)],
++					iname->len - sizeof(nokey_name.bytes),
++					nokey_name.sha256);
++		if (err)
++			return err;
++		size = FSCRYPT_NOKEY_NAME_MAX;
+ 	}
+-	memcpy(digested_name.digest,
+-	       FSCRYPT_FNAME_DIGEST(iname->name, iname->len),
+-	       FSCRYPT_FNAME_DIGEST_SIZE);
+-	oname->name[0] = '_';
+-	oname->len = 1 + base64_encode((const u8 *)&digested_name,
+-				       sizeof(digested_name), oname->name + 1);
++	oname->len = base64_encode((const u8 *)&nokey_name, size, oname->name);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(fscrypt_fname_disk_to_usr);
+@@ -307,8 +396,7 @@ EXPORT_SYMBOL(fscrypt_fname_disk_to_usr);
+  * get the disk_name.
+  *
+  * Else, for keyless @lookup operations, @iname is the presented ciphertext, so
+- * we decode it to get either the ciphertext disk_name (for short names) or the
+- * fscrypt_digested_name (for long names).  Non-@lookup operations will be
++ * we decode it to get the fscrypt_nokey_name.  Non-@lookup operations will be
+  * impossible in this case, so we fail them with ENOKEY.
+  *
+  * If successful, fscrypt_free_filename() must be called later to clean up.
+@@ -318,8 +406,8 @@ EXPORT_SYMBOL(fscrypt_fname_disk_to_usr);
+ int fscrypt_setup_filename(struct inode *dir, const struct qstr *iname,
+ 			      int lookup, struct fscrypt_name *fname)
+ {
++	struct fscrypt_nokey_name *nokey_name;
+ 	int ret;
+-	int digested;
+ 
+ 	memset(fname, 0, sizeof(struct fscrypt_name));
+ 	fname->usr_fname = iname;
+@@ -359,40 +447,31 @@ int fscrypt_setup_filename(struct inode *dir, const struct qstr *iname,
+ 	 * We don't have the key and we are doing a lookup; decode the
+ 	 * user-supplied name
+ 	 */
+-	if (iname->name[0] == '_') {
+-		if (iname->len !=
+-		    1 + BASE64_CHARS(sizeof(struct fscrypt_digested_name)))
+-			return -ENOENT;
+-		digested = 1;
+-	} else {
+-		if (iname->len >
+-		    BASE64_CHARS(FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE))
+-			return -ENOENT;
+-		digested = 0;
+-	}
+ 
+-	fname->crypto_buf.name =
+-		kmalloc(max_t(size_t, FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE,
+-			      sizeof(struct fscrypt_digested_name)),
+-			GFP_KERNEL);
++	if (iname->len > BASE64_CHARS(FSCRYPT_NOKEY_NAME_MAX))
++		return -ENOENT;
++
++	fname->crypto_buf.name = kmalloc(FSCRYPT_NOKEY_NAME_MAX, GFP_KERNEL);
+ 	if (fname->crypto_buf.name == NULL)
+ 		return -ENOMEM;
+ 
+-	ret = base64_decode(iname->name + digested, iname->len - digested,
+-			    fname->crypto_buf.name);
+-	if (ret < 0) {
++	ret = base64_decode(iname->name, iname->len, fname->crypto_buf.name);
++	if (ret < (int)offsetof(struct fscrypt_nokey_name, bytes[1]) ||
++	    (ret > offsetof(struct fscrypt_nokey_name, sha256) &&
++	     ret != FSCRYPT_NOKEY_NAME_MAX)) {
+ 		ret = -ENOENT;
+ 		goto errout;
+ 	}
+ 	fname->crypto_buf.len = ret;
+-	if (digested) {
+-		const struct fscrypt_digested_name *n =
+-			(const void *)fname->crypto_buf.name;
+-		fname->hash = n->hash;
+-		fname->minor_hash = n->minor_hash;
+-	} else {
+-		fname->disk_name.name = fname->crypto_buf.name;
+-		fname->disk_name.len = fname->crypto_buf.len;
++
++	nokey_name = (void *)fname->crypto_buf.name;
++	fname->hash = nokey_name->dirhash[0];
++	fname->minor_hash = nokey_name->dirhash[1];
++	if (ret != FSCRYPT_NOKEY_NAME_MAX) {
++		/* The full ciphertext filename is available. */
++		fname->disk_name.name = nokey_name->bytes;
++		fname->disk_name.len =
++			ret - offsetof(struct fscrypt_nokey_name, bytes);
+ 	}
+ 	return 0;
+ 
+@@ -402,6 +481,43 @@ errout:
+ }
+ EXPORT_SYMBOL(fscrypt_setup_filename);
+ 
++/**
++ * fscrypt_match_name() - test whether the given name matches a directory entry
++ * @fname: the name being searched for
++ * @de_name: the name from the directory entry
++ * @de_name_len: the length of @de_name in bytes
++ *
++ * Normally @fname->disk_name will be set, and in that case we simply compare
++ * that to the name stored in the directory entry.  The only exception is that
++ * if we don't have the key for an encrypted directory and the name we're
++ * looking for is very long, then we won't have the full disk_name and instead
++ * we'll need to match against a fscrypt_nokey_name that includes a strong hash.
++ *
++ * Return: %true if the name matches, otherwise %false.
++ */
++bool fscrypt_match_name(const struct fscrypt_name *fname,
++			const u8 *de_name, u32 de_name_len)
++{
++	const struct fscrypt_nokey_name *nokey_name =
++		(const void *)fname->crypto_buf.name;
++	u8 sha256[SHA256_DIGEST_SIZE];
++
++	if (likely(fname->disk_name.name)) {
++		if (de_name_len != fname->disk_name.len)
++			return false;
++		return !memcmp(de_name, fname->disk_name.name, de_name_len);
++	}
++	if (de_name_len <= sizeof(nokey_name->bytes))
++		return false;
++	if (memcmp(de_name, nokey_name->bytes, sizeof(nokey_name->bytes)))
++		return false;
++	if (fscrypt_do_sha256(&de_name[sizeof(nokey_name->bytes)],
++			      de_name_len - sizeof(nokey_name->bytes), sha256))
++		return false;
++	return !memcmp(sha256, nokey_name->sha256, sizeof(sha256));
++}
++EXPORT_SYMBOL_GPL(fscrypt_match_name);
++
+ /**
+  * fscrypt_fname_siphash() - calculate the SipHash of a filename
+  * @dir: the parent directory
+diff --git a/include/linux/fscrypt.h b/include/linux/fscrypt.h
+index 34bc5f73200c..556f4adf5dc5 100644
+--- a/include/linux/fscrypt.h
++++ b/include/linux/fscrypt.h
+@@ -172,81 +172,8 @@ extern int fscrypt_fname_disk_to_usr(const struct inode *inode,
+ 				     u32 hash, u32 minor_hash,
+ 				     const struct fscrypt_str *iname,
+ 				     struct fscrypt_str *oname);
+-
+-#define FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE	32
+-
+-/* Extracts the second-to-last ciphertext block; see explanation below */
+-#define FSCRYPT_FNAME_DIGEST(name, len)	\
+-	((name) + round_down((len) - FS_CRYPTO_BLOCK_SIZE - 1, \
+-			     FS_CRYPTO_BLOCK_SIZE))
+-
+-#define FSCRYPT_FNAME_DIGEST_SIZE	FS_CRYPTO_BLOCK_SIZE
+-
+-/**
+- * fscrypt_digested_name - alternate identifier for an on-disk filename
+- *
+- * When userspace lists an encrypted directory without access to the key,
+- * filenames whose ciphertext is longer than FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE
+- * bytes are shown in this abbreviated form (base64-encoded) rather than as the
+- * full ciphertext (base64-encoded).  This is necessary to allow supporting
+- * filenames up to NAME_MAX bytes, since base64 encoding expands the length.
+- *
+- * To make it possible for filesystems to still find the correct directory entry
+- * despite not knowing the full on-disk name, we encode any filesystem-specific
+- * 'hash' and/or 'minor_hash' which the filesystem may need for its lookups,
+- * followed by the second-to-last ciphertext block of the filename.  Due to the
+- * use of the CBC-CTS encryption mode, the second-to-last ciphertext block
+- * depends on the full plaintext.  (Note that ciphertext stealing causes the
+- * last two blocks to appear "flipped".)  This makes accidental collisions very
+- * unlikely: just a 1 in 2^128 chance for two filenames to collide even if they
+- * share the same filesystem-specific hashes.
+- *
+- * However, this scheme isn't immune to intentional collisions, which can be
+- * created by anyone able to create arbitrary plaintext filenames and view them
+- * without the key.  Making the "digest" be a real cryptographic hash like
+- * SHA-256 over the full ciphertext would prevent this, although it would be
+- * less efficient and harder to implement, especially since the filesystem would
+- * need to calculate it for each directory entry examined during a search.
+- */
+-struct fscrypt_digested_name {
+-	u32 hash;
+-	u32 minor_hash;
+-	u8 digest[FSCRYPT_FNAME_DIGEST_SIZE];
+-};
+-
+-/**
+- * fscrypt_match_name() - test whether the given name matches a directory entry
+- * @fname: the name being searched for
+- * @de_name: the name from the directory entry
+- * @de_name_len: the length of @de_name in bytes
+- *
+- * Normally @fname->disk_name will be set, and in that case we simply compare
+- * that to the name stored in the directory entry.  The only exception is that
+- * if we don't have the key for an encrypted directory and a filename in it is
+- * very long, then we won't have the full disk_name and we'll instead need to
+- * match against the fscrypt_digested_name.
+- *
+- * Return: %true if the name matches, otherwise %false.
+- */
+-static inline bool fscrypt_match_name(const struct fscrypt_name *fname,
+-				      const u8 *de_name, u32 de_name_len)
+-{
+-	if (unlikely(!fname->disk_name.name)) {
+-		const struct fscrypt_digested_name *n =
+-			(const void *)fname->crypto_buf.name;
+-		if (WARN_ON_ONCE(fname->usr_fname->name[0] != '_'))
+-			return false;
+-		if (de_name_len <= FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE)
+-			return false;
+-		return !memcmp(FSCRYPT_FNAME_DIGEST(de_name, de_name_len),
+-			       n->digest, FSCRYPT_FNAME_DIGEST_SIZE);
+-	}
+-
+-	if (de_name_len != fname->disk_name.len)
+-		return false;
+-	return !memcmp(de_name, fname->disk_name.name, fname->disk_name.len);
+-}
+-
++extern bool fscrypt_match_name(const struct fscrypt_name *fname,
++			       const u8 *de_name, u32 de_name_len);
+ extern u64 fscrypt_fname_siphash(const struct inode *dir,
+ 				 const struct qstr *name);
+ 
+-- 
+cgit 1.2-0.3.lf.el7
+

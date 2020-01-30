@@ -34,11 +34,13 @@ source=(https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${_basekernel}.tar.{x
 		# amdgpu
 		#
 		# BMQ scheduler
-		#0001-bmq-linux54-20200117.patch::https://gitlab.com/alfredchen/bmq/raw/master/5.4/bmq_v5.4-r2.patch
+		#0001-bmq-linux55-20200126.patch::https://gitlab.com/alfredchen/bmq/raw/master/5.5/bmq_v5.5-r0.patch
 		# sirlucjan
 		0001-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0001-futex-Split-key-setup-from-key-queue-locking-and-rea.patch
 		0002-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0002-futex-Implement-mechanism-to-wait-on-any-of-several-.patch
 		0003-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0003-futex-Change-WAIT_MULTIPLE-opcode-to-31.patch
+		0001-enable-O3-opt-for-all-archs.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/cpu-patches-sep/0002-init-Kconfig-enable-O3-for-all-arches.patch
+		# Clear Linux
 		0001-clearlinux-tweak-intel-cpuidle.patch::https://raw.githubusercontent.com/clearlinux-pkgs/linux/master/0106-intel_idle-tweak-cpuidle-cstates.patch
 		0002-clearlinux-add-config-opt-for-raid6-bench.patch::https://raw.githubusercontent.com/clearlinux-pkgs/linux/master/0109-raid6-add-Kconfig-option-to-skip-raid6-benchmarking.patch
 		0003-clearlinux-init-ata-before-graphics.patch::https://raw.githubusercontent.com/clearlinux-pkgs/linux/master/0110-Initialize-ata-before-graphics.patch
@@ -49,7 +51,13 @@ source=(https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${_basekernel}.tar.{x
 		0004-tune-cpufreq-ondemand.patch
 		0005-cpu-optimisations-graysky.patch
 		0006-hwmon-56-backports.patch
+		0007-fscrypt-56-backports.patch
 		# hho
+		#
+		# cfs/sched tweaks
+		0001-sched-dont-skip-remote-tick-for-idle-cpus.patch
+		0002-sched-update-nohz-load-in-remote-tick.patch
+		0003-sched-optimize-select_idle_core.patch
 )
 
 validpgpkeys=(
@@ -59,8 +67,8 @@ validpgpkeys=(
 
 sha256sums=('a6fbd4ee903c128367892c2393ee0d9657b6ed3ea90016d4dc6f1f6da20b2330'
             'SKIP'
-            '1a9457388ad6cd25315cc88fc873b9a82fd43f6f01c69a1e822b3313821e77aa'
-            '9548e4b014631b30e09be67bbe5ee28458a911e178ddf5564b4e45d688a971a9'
+            'c88af29e587fb769b1902966800212079920435871d96cc9bbfbaab3a2880dc8'
+            '6f3373cceecc2e93b76d9b8ccd5c975423ea906eec7c0a4cfd723a59c2882636'
             'ab010dc5ef6ce85d352956e5996d242246ecd0912b30f0b72025c38eadff8cd5'
             'c14f60f37c5ef16d104aaa05fdc470f8d6d341181f5370b92918c283728e5625'
             '15a2ec0128ee1910b13c841bda7f90172b6731bfce4fba9d685bfb2333a3d85e'
@@ -69,6 +77,7 @@ sha256sums=('a6fbd4ee903c128367892c2393ee0d9657b6ed3ea90016d4dc6f1f6da20b2330'
             'fd1f34cf87e72ccd6070590028ad34e12dc42285637a0c61894680cb81d4fb88'
             '9660f0d31bdc5718b7fde41015898f67dce86602886585848d6300dfce2542db'
             'cd228e4b62cab5679c93cd0eda5d96d570f1b3ba84340eddd2d049f2a07eef9d'
+            '1c949aa5ca3beb4c84eccf57806d6cbe88c83b1cb79941002bc4b4954543f796'
             '88b5597753b01f90f77b99580943263969902ffc084972f8843e0659fdd5eb8f'
             '47d26eb8a2ec74b3684ab61837ecfcdad5cdc40722ca01a32684dfdd3775fafc'
             'b4a3d140bc93e4d224570c0f6b87c40c64148571588064858fcdc9f2406feeaa'
@@ -77,7 +86,11 @@ sha256sums=('a6fbd4ee903c128367892c2393ee0d9657b6ed3ea90016d4dc6f1f6da20b2330'
             '4b5d20022693ff63450fae6646b07caf00e0a97be49526995cad0365bc9269b6'
             '4281dfd457e93d39220bc3462a80a56b0b1b9f50987a59c0c4352338d70b7b71'
             'cc739c9c9f7ce08e6bbc161b8232208bbc00820342a32fb1f69bff6326ae1370'
-            '342fc1d096324b92f69a27b4ec8e9b1e82ab87ae3042b0bd95f3b97820f98895')
+            '342fc1d096324b92f69a27b4ec8e9b1e82ab87ae3042b0bd95f3b97820f98895'
+            'aeea1112bff861ad5c6bb1b90393463b2141517c6d32e8a68b43729380ebea42'
+            'b63220b9cb8295852838a0a4faccc3a6aead7f044a65df3f4945e502afbd0440'
+            'f470403d798e300eaf321a97aad2141561324c4c5658500b64a2029e7e521a08'
+            '67067a67fb75193b3608ab61fdca94228f74b2b360cf277bdfe6f7561658c9f4')
 
 export KBUILD_BUILD_USER=systemd-run
 export KBUILD_BUILD_HOST=manjaro
@@ -135,7 +148,7 @@ prepare() {
       echo "Path does not exist. Aborting..." ; exit 2
     fi
   else
-    sed -i 's/vd54\-kernel\-key/signing\_key/' ./.config || exit 2
+    sed -i 's/vd55\-kernel\-key/signing\_key/' ./.config || exit 2
   fi
 
   if [ "${_kernelname}" != "" ]; then
