@@ -11,7 +11,7 @@ pkgbase=linux55-vd
 pkgname=('linux55-vd' 'linux55-vd-headers')
 _basekernel=5.5
 _kernelname=-vd
-_sub=0
+_sub=1
 kernelbase=${_basekernel}${_kernelname}
 pkgver=${_basekernel}.${_sub}
 pkgrel=1
@@ -21,7 +21,7 @@ url="http://www.kernel.org/"
 license=('GPL2')
 makedepends=('xmlto' 'docbook-xsl' 'kmod' 'inetutils' 'bc' 'elfutils' 'git')
 options=('!strip')
-source=(https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${_basekernel}.tar.{xz,sign}
+source=(https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${pkgver}.tar.{xz,sign}
 		# the main kernel config files
 		'config.x86_64' 'config.vd' 'x509.genkey' "${pkgbase}.preset"
 		# Prepatch from stable-queue
@@ -65,10 +65,10 @@ validpgpkeys=(
   '647F28654894E3BD457199BE38DBBDC86092693E'  # Greg Kroah-Hartman
 )
 
-sha256sums=('a6fbd4ee903c128367892c2393ee0d9657b6ed3ea90016d4dc6f1f6da20b2330'
+sha256sums=('0323916148e3bccf478a43bc650d0c3a2debbc5a152c5f37256a900bd7e730d9'
             'SKIP'
             'c88af29e587fb769b1902966800212079920435871d96cc9bbfbaab3a2880dc8'
-            '6f3373cceecc2e93b76d9b8ccd5c975423ea906eec7c0a4cfd723a59c2882636'
+            'b0467d5b02dc2c2722dfe72e1c8ba78b1c4943d69cd913cefebad28830626412'
             'ab010dc5ef6ce85d352956e5996d242246ecd0912b30f0b72025c38eadff8cd5'
             '47ec1e67dbd355a9cfa457a9c9a796d756c7159194d36917ab453e20a60114e3'
             '15a2ec0128ee1910b13c841bda7f90172b6731bfce4fba9d685bfb2333a3d85e'
@@ -98,7 +98,7 @@ export KBUILD_BUILD_HOST=manjaro
 prepare() {
   local TBOLD=$(tput bold)
   local TNORMAL=$(tput sgr0)
-  cd "${srcdir}/linux-${_basekernel}"
+  cd "${srcdir}/linux-${pkgver}"
 
   # add latest fixes from stable queue, if needed
   # http://git.kernel.org/?p=linux/kernel/git/stable/stable-queue.git
@@ -127,7 +127,7 @@ prepare() {
   local _config
   echo "---- Select configuration file:"
   echo "${TBOLD}1)${TNORMAL} Manjaro default"
-  echo "${TBOLD}2)${TNORMAL} vd default"
+  echo "${TBOLD}2)${TNORMAL} x570/x270"
   while true ; do
   	read -p "Enter number (1-5): " _config
 	  case ${_config} in
@@ -178,7 +178,7 @@ prepare() {
 }
 
 build() {
-  cd "${srcdir}/linux-${_basekernel}"
+  cd "${srcdir}/linux-${pkgver}"
 
   # build!
   make ${MAKEFLAGS} LOCALVERSION= bzImage modules
@@ -190,7 +190,7 @@ package_linux55-vd() {
   optdepends=('crda: to set the correct wireless channels of your country')
   provides=("linux=${pkgver}")
 
-  cd "${srcdir}/linux-${_basekernel}"
+  cd "${srcdir}/linux-${pkgver}"
 
   KARCH=x86
 
@@ -247,7 +247,7 @@ package_linux55-vd-headers() {
   pkgdesc="Header files and scripts for building modules for ${pkgbase/linux/Linux} vd kernel"
   provides=("linux-headers=$pkgver")
 
-  cd "${srcdir}/linux-${_basekernel}"
+  cd "${srcdir}/linux-${pkgver}"
   local kernver="$(<version)"
   local _builddir="${pkgdir}/usr/lib/modules/${kernver}/build"
 
