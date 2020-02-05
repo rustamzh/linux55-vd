@@ -11,11 +11,11 @@ pkgbase=linux55-vd
 pkgname=('linux55-vd' 'linux55-vd-headers')
 _basekernel=5.5
 _kernelname=-vd
-_sub=1
+_sub=2
 kernelbase=${_basekernel}${_kernelname}
 pkgver=${_basekernel}.${_sub}
 pkgrel=1
-_archpatch=20200130
+_archpatch=20200204
 arch=('x86_64')
 url="http://www.kernel.org/"
 license=('GPL2')
@@ -27,7 +27,7 @@ source=(https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${pkgver}.tar.{xz,sig
 		# Prepatch from stable-queue
 		#
 		# ARCH Patches
-		0001-arch-patches-${_archpatch}.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/arch-patches-v2/0001-arch-patches.patch
+		0001-arch-patches-${_archpatch}.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/arch-patches-v5/0001-arch-patches.patch
 		# MANJARO Patches
 		0001-i2c-nuvoton-nc677x-hwmon-driver.patch
 		0002-amdgpu-nonupstream-navi10-vfio-reset.patch
@@ -65,13 +65,13 @@ validpgpkeys=(
   '647F28654894E3BD457199BE38DBBDC86092693E'  # Greg Kroah-Hartman
 )
 
-sha256sums=('0323916148e3bccf478a43bc650d0c3a2debbc5a152c5f37256a900bd7e730d9'
+sha256sums=('24f5f383b0337374f160723bcf3bf679c75cb5bd3fd0824a56998e47c04ef99e'
             'SKIP'
             'c88af29e587fb769b1902966800212079920435871d96cc9bbfbaab3a2880dc8'
             'b0467d5b02dc2c2722dfe72e1c8ba78b1c4943d69cd913cefebad28830626412'
             'ab010dc5ef6ce85d352956e5996d242246ecd0912b30f0b72025c38eadff8cd5'
             '47ec1e67dbd355a9cfa457a9c9a796d756c7159194d36917ab453e20a60114e3'
-            '15a2ec0128ee1910b13c841bda7f90172b6731bfce4fba9d685bfb2333a3d85e'
+            '9ea3ef92c8fa11b78fe58f40d3dd08248e46fdfab54dfc63fa5707f91adf2d23'
             '0556859a8168c8f7da9af8e2059d33216d9e5378d2cac70ca54c5ff843fa5add'
             '7a2758f86dd1339f0f1801de2dbea059b55bf3648e240878b11e6d6890d3089c'
             'fd1f34cf87e72ccd6070590028ad34e12dc42285637a0c61894680cb81d4fb88'
@@ -86,7 +86,7 @@ sha256sums=('0323916148e3bccf478a43bc650d0c3a2debbc5a152c5f37256a900bd7e730d9'
             '4b5d20022693ff63450fae6646b07caf00e0a97be49526995cad0365bc9269b6'
             '4281dfd457e93d39220bc3462a80a56b0b1b9f50987a59c0c4352338d70b7b71'
             'cc739c9c9f7ce08e6bbc161b8232208bbc00820342a32fb1f69bff6326ae1370'
-            '342fc1d096324b92f69a27b4ec8e9b1e82ab87ae3042b0bd95f3b97820f98895'
+            'edfff1acfc374cb01c28c464e5a4feaa8b54f6ece3be02d71ca9cde3da0a909e'
             'aeea1112bff861ad5c6bb1b90393463b2141517c6d32e8a68b43729380ebea42'
             'b63220b9cb8295852838a0a4faccc3a6aead7f044a65df3f4945e502afbd0440'
             'f470403d798e300eaf321a97aad2141561324c4c5658500b64a2029e7e521a08'
