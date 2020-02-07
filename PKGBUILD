@@ -14,8 +14,8 @@ _kernelname=-vd
 _sub=2
 kernelbase=${_basekernel}${_kernelname}
 pkgver=${_basekernel}.${_sub}
-pkgrel=1
-_archpatch=20200204
+pkgrel=2
+_archpatch=20200205
 arch=('x86_64')
 url="http://www.kernel.org/"
 license=('GPL2')
@@ -27,7 +27,7 @@ source=(https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${pkgver}.tar.{xz,sig
 		# Prepatch from stable-queue
 		#
 		# ARCH Patches
-		0001-arch-patches-${_archpatch}.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/arch-patches-v5/0001-arch-patches.patch
+		0001-arch-patches-${_archpatch}.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/arch-patches-v7/0001-arch-patches.patch
 		# MANJARO Patches
 		0001-i2c-nuvoton-nc677x-hwmon-driver.patch
 		0002-amdgpu-nonupstream-navi10-vfio-reset.patch
@@ -36,14 +36,19 @@ source=(https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${pkgver}.tar.{xz,sig
 		# BMQ scheduler
 		#0001-bmq-linux55-20200126.patch::https://gitlab.com/alfredchen/bmq/raw/master/5.5/bmq_v5.5-r0.patch
 		# sirlucjan
-		0001-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0001-futex-Split-key-setup-from-key-queue-locking-and-rea.patch
-		0002-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0002-futex-Implement-mechanism-to-wait-on-any-of-several-.patch
-		0003-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0003-futex-Change-WAIT_MULTIPLE-opcode-to-31.patch
+		#0001-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0001-futex-Split-key-setup-from-key-queue-locking-and-rea.patch
+		#0002-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0002-futex-Implement-mechanism-to-wait-on-any-of-several-.patch
+		#0003-futex-steam-fsync.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/futex-patches-sep/0003-futex-Change-WAIT_MULTIPLE-opcode-to-31.patch
 		0001-enable-O3-opt-for-all-archs.patch::https://raw.githubusercontent.com/sirlucjan/kernel-patches/master/5.5/cpu-patches-sep/0002-init-Kconfig-enable-O3-for-all-arches.patch
 		# Clear Linux
 		0001-clearlinux-tweak-intel-cpuidle.patch::https://raw.githubusercontent.com/clearlinux-pkgs/linux/master/0106-intel_idle-tweak-cpuidle-cstates.patch
 		0002-clearlinux-add-config-opt-for-raid6-bench.patch::https://raw.githubusercontent.com/clearlinux-pkgs/linux/master/0109-raid6-add-Kconfig-option-to-skip-raid6-benchmarking.patch
 		0003-clearlinux-init-ata-before-graphics.patch::https://raw.githubusercontent.com/clearlinux-pkgs/linux/master/0110-Initialize-ata-before-graphics.patch
+		# steam futex
+		0001-futex-steam-fsync.patch::https://gitlab.collabora.com/krisman/linux/commit/40ccab595e3dc54e474c1942162d5b678ff62f4c.diff
+		0002-futex-steam-fsync.patch::https://gitlab.collabora.com/krisman/linux/commit/4576c43d6bcc275b6576f94f322519782ee621f8.diff
+		0003-futex-steam-fsync.patch::https://gitlab.collabora.com/krisman/linux/commit/464c38516d56872d009f7b0e3bfdab363011e4fe.diff
+		0004-futex-steam-fsync.patch::https://gitlab.collabora.com/krisman/linux/commit/3efc9c50ad64cb234fae91d430c4fba391bf1024.diff
 		# vd
 		0001-tune-vm-and-vfs-settings.patch
 		0002-tune-cfs-scheduler.patch
@@ -51,7 +56,8 @@ source=(https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${pkgver}.tar.{xz,sig
 		0004-tune-cpufreq-ondemand.patch
 		0005-cpu-optimisations-graysky.patch
 		0006-hwmon-56-backports.patch
-		0007-fscrypt-56-backports.patch
+		0007-ext4-for-fscrypt-56-backports.patch
+		0008-fscrypt-56-backports.patch
 		# hho
 		#
 		# cfs/sched tweaks
@@ -71,29 +77,31 @@ sha256sums=('24f5f383b0337374f160723bcf3bf679c75cb5bd3fd0824a56998e47c04ef99e'
             'b0467d5b02dc2c2722dfe72e1c8ba78b1c4943d69cd913cefebad28830626412'
             'ab010dc5ef6ce85d352956e5996d242246ecd0912b30f0b72025c38eadff8cd5'
             '47ec1e67dbd355a9cfa457a9c9a796d756c7159194d36917ab453e20a60114e3'
-            '9ea3ef92c8fa11b78fe58f40d3dd08248e46fdfab54dfc63fa5707f91adf2d23'
+            'a01bc61cacb32bb71c4d0257000595dbb4d0f3efa498b9d5b8263a1b8c5ca70f'
             '0556859a8168c8f7da9af8e2059d33216d9e5378d2cac70ca54c5ff843fa5add'
             '7a2758f86dd1339f0f1801de2dbea059b55bf3648e240878b11e6d6890d3089c'
-            'fd1f34cf87e72ccd6070590028ad34e12dc42285637a0c61894680cb81d4fb88'
-            '9660f0d31bdc5718b7fde41015898f67dce86602886585848d6300dfce2542db'
-            'cd228e4b62cab5679c93cd0eda5d96d570f1b3ba84340eddd2d049f2a07eef9d'
             '1c949aa5ca3beb4c84eccf57806d6cbe88c83b1cb79941002bc4b4954543f796'
             '88b5597753b01f90f77b99580943263969902ffc084972f8843e0659fdd5eb8f'
             '47d26eb8a2ec74b3684ab61837ecfcdad5cdc40722ca01a32684dfdd3775fafc'
             'b4a3d140bc93e4d224570c0f6b87c40c64148571588064858fcdc9f2406feeaa'
+            '4cefd83b24f6c3a7d9e86075649d00c28305c52e6492b67ad32fca6a42ed8d39'
+            '2c901cb8975284fb4c5d2b18455eb24a47272f716305425d1c70a38dfd1c8935'
+            '68d11fd871015bce86924e90bd15e6adc243f2b3a0ae4c48a57852b17e45b15c'
+            'cd8ec9de797e7700b6dd7d560e7f94ba202c8ffbfce8cbad1dfaad8d959662b7'
             '725d6693af00daf0a1e2fe8042249dfd16b90bb3f72e5cb841b9e4f7b82e4b7d'
             '58fd33be8d9ab594a01f1da5858567ac7ce8d3e44e0f2f3682e9104c4fb07514'
             '4b5d20022693ff63450fae6646b07caf00e0a97be49526995cad0365bc9269b6'
-            '4281dfd457e93d39220bc3462a80a56b0b1b9f50987a59c0c4352338d70b7b71'
+            '97f59d09ef55ea8a3634ea426fdc5db0591f77cca14cfe2db49176f71af80037'
             'cc739c9c9f7ce08e6bbc161b8232208bbc00820342a32fb1f69bff6326ae1370'
             'edfff1acfc374cb01c28c464e5a4feaa8b54f6ece3be02d71ca9cde3da0a909e'
+            '516aba4e5547f912d9ca8471727dcc1b8ddc2bec2053eab44cfa7aeaa4aa2a5b'
             'aeea1112bff861ad5c6bb1b90393463b2141517c6d32e8a68b43729380ebea42'
             'b63220b9cb8295852838a0a4faccc3a6aead7f044a65df3f4945e502afbd0440'
             'f470403d798e300eaf321a97aad2141561324c4c5658500b64a2029e7e521a08'
             '67067a67fb75193b3608ab61fdca94228f74b2b360cf277bdfe6f7561658c9f4')
 
-export KBUILD_BUILD_USER=systemd-run
-export KBUILD_BUILD_HOST=manjaro
+export KBUILD_BUILD_USER=manjaro
+export KBUILD_BUILD_HOST=systemd-run
 
 prepare() {
   local TBOLD=$(tput bold)
@@ -111,15 +119,13 @@ prepare() {
   # apply patch from the source array (should be a pacman feature)
   local filename filename2
   for filename in "${source[@]}"; do
-  	if [[ "$filename" =~ \.patch$ ]]; then
+  	if [[ "$filename" =~ \.patch$ || "$filename" =~ \.diff$ ]]; then
 		filename="${filename%%::*}"
 		filename2="${filename#*-}"
         	echo -e "\n---- Applying patch ${TBOLD}${filename2%%.*}${TNORMAL}:"
         	patch -Np1 -i "$srcdir/${filename}"
   	fi
   done
-
-  cat ../x509.genkey > ./certs/x509.genkey
 
   # kernel config
   printf '\n'
@@ -148,6 +154,7 @@ prepare() {
       echo "Path does not exist. Aborting..." ; exit 2
     fi
   else
+    cat ../x509.genkey > ./certs/x509.genkey
     sed -i 's/vd55\-kernel\-key/signing\_key/' ./.config || exit 2
   fi
 
@@ -171,7 +178,7 @@ prepare() {
   printf '\n'
   msg2 "Prepared %s version %s" "$pkgbase" "$(<version)"
   read -p "---- Enter 'y' for nconfig: " NCONFIG
-  if [[ $NCONFIG = "y" ]] ; then make nconfig ; fi
+  [[ $NCONFIG = "y" ]] && make nconfig
 
   # rewrite configuration
   yes "" | make config >/dev/null
